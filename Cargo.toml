@@ -1,0 +1,69 @@
+[package]
+name = "tsp-ltv"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Shared timestamping (RFC 3161) and long-term validation (OCSP, CRL, trust stores) infrastructure for AdES signatures"
+license = "BSD-2-Clause"
+keywords = ["tsp", "ocsp", "crl", "x509", "digital-signature"]
+categories = ["cryptography"]
+
+[features]
+default = ["tsp", "ltv", "blocking"]
+
+# RFC 3161 timestamping (TSA client)
+tsp = ["dep:reqwest", "dep:tokio"]
+
+# Long-term validation (OCSP/CRL/chain fetching) — requires TSP for network deps
+ltv = ["tsp"]
+
+# Blocking (synchronous) API wrappers via tokio block_on()
+blocking = ["dep:tokio"]
+
+[dependencies]
+# CMS / PKCS#7 / X.509 (RustCrypto ecosystem)
+cms = { version = "0.2", features = ["alloc"] }
+x509-cert = { version = "0.2", features = ["pem"] }
+der = { version = "0.7", features = ["alloc", "oid"] }
+spki = "0.7"
+const-oid = { version = "0.9", features = ["db"] }
+
+# Signing algorithms (for certificate/OCSP/CRL signature verification)
+rsa = { version = "0.9", features = ["sha2"] }
+ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+p521 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+ed25519-dalek = { version = "2", features = ["pem"] }
+signature = "2"
+
+# Hashing (for OCSP request building, CRL verification, TSP)
+sha2 = "0.10"
+sha3 = "0.10"
+sha1 = { version = "0.10", features = ["oid"] }
+md-5 = { version = "0.10", features = ["oid"] }
+digest = "0.10"
+
+# Error handling
+thiserror = "2"
+
+# Hex encoding
+hex = "0.4"
+
+# PEM / Base64
+pem-rfc7468 = "0.7"
+base64 = "0.22"
+
+# Logging
+log = "0.4"
+
+# Time
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+# HTTP client — optional (TSA, OCSP, CRL fetching)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+tokio = { version = "1", features = ["rt", "macros", "time"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
