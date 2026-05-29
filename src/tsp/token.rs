@@ -565,7 +565,7 @@ fn verify_token_cms(
         &signed_attrs_der,
         signer_info.signature.as_bytes(),
         &spki_der,
-        &signer_info.signature_algorithm.oid,
+        &signer_info.signature_algorithm,
         digest_alg,
     )
     .map_err(|e| {
@@ -698,38 +698,34 @@ fn find_attribute<'a>(
 /// (`rsaEncryption`, `id-ecPublicKey`, `rsassaPss`) rather than a combined
 /// sig+hash OID. The authoritative hash is `SignerInfo.digestAlgorithm`
 /// (`digest_alg`), so we bind verification to it:
-/// - RSASSA-PSS is verified with **exactly** `digest_alg` (not a trial of
-///   several hashes), so a PSS signature whose hash disagrees with
-///   `digestAlgorithm` is rejected.
+/// - RSASSA-PSS is verified strictly according to its `RSASSA-PSS-params`
+///   (hashAlgorithm, MGF1 hash, saltLength, trailerField), and those
+///   parameters must agree with `digestAlgorithm`. See [`verify_pss_signature`].
 /// - Bare `rsaEncryption` / `id-ecPublicKey` are mapped to the combined OID for
 ///   `digest_alg`.
-/// - Anything else is already a combined OID and passed through.
+/// - A combined OID (sha256WithRSAEncryption, ecdsa-with-SHA256, ...) is passed
+///   through, but only after checking that the hash it encodes matches
+///   `digestAlgorithm`; a mismatch is rejected rather than silently accepted.
 fn verify_cms_signature(
     signed_attrs_der: &[u8],
     signature: &[u8],
     spki_der: &[u8],
-    sig_alg_oid: &ObjectIdentifier,
+    signature_algorithm: &AlgorithmIdentifierOwned,
     digest_alg: DigestAlgorithm,
 ) -> Result<(), TrustError> {
-    use crate::crypto::verify::{verify_rsa_pss_signature, verify_signature_by_oid};
+    use crate::crypto::verify::verify_signature_by_oid;
     use const_oid::db;
 
+    let sig_alg_oid = &signature_algorithm.oid;
+
     if *sig_alg_oid == OID_RSASSA_PSS {
-        // Bind PSS to the SignerInfo.digestAlgorithm hash.
-        return match digest_alg {
-            DigestAlgorithm::Sha256 => {
-                verify_rsa_pss_signature::<sha2::Sha256>(signed_attrs_der, signature, spki_der)
-            }
-            DigestAlgorithm::Sha384 => {
-                verify_rsa_pss_signature::<sha2::Sha384>(signed_attrs_der, signature, spki_der)
-            }
-            DigestAlgorithm::Sha512 => {
-                verify_rsa_pss_signature::<sha2::Sha512>(signed_attrs_der, signature, spki_der)
-            }
-            other => Err(TrustError::UnsupportedAlgorithm(format!(
-                "RSASSA-PSS with digest {other:?}"
-            ))),
-        };
+        return verify_pss_signature(
+            signed_attrs_der,
+            signature,
+            spki_der,
+            signature_algorithm,
+            digest_alg,
+        );
     }
 
     let resolved = if *sig_alg_oid == OID_RSA_ENCRYPTION {
@@ -748,11 +744,144 @@ fn verify_cms_signature(
         }
     } else {
         // Already a combined OID (sha256WithRSAEncryption, ecdsa-with-SHA256,
-        // Ed25519, ...) — pass through unchanged.
+        // Ed25519, ...). For the RSA/ECDSA combined forms the hash is encoded in
+        // the OID itself; reject any token whose signatureAlgorithm hash
+        // disagrees with the SignerInfo.digestAlgorithm used for the
+        // message-digest attribute, instead of trusting two inconsistent hashes.
+        if let Some(embedded) = combined_oid_digest(sig_alg_oid) {
+            if embedded != digest_alg {
+                return Err(TrustError::SignatureVerification(format!(
+                    "signatureAlgorithm hash ({}) disagrees with SignerInfo.digestAlgorithm ({})",
+                    embedded.name(),
+                    digest_alg.name(),
+                )));
+            }
+        }
         *sig_alg_oid
     };
 
     verify_signature_by_oid(signed_attrs_der, signature, spki_der, &resolved)
+}
+
+/// Verify an RSASSA-PSS `SignerInfo` signature strictly per its
+/// `RSASSA-PSS-params` (RFC 4055).
+///
+/// For PSS the salt length, MGF1 hash, and trailer field are part of the
+/// algorithm definition and live in `signature_algorithm.parameters` — they are
+/// not implied by the OID. This decodes them and enforces:
+/// - the PSS `hashAlgorithm` is supported and equals `digestAlgorithm`,
+/// - `maskGenAlgorithm` is MGF1 keyed to that same hash (the only form RFC 4055
+///   recommends and the underlying verifier supports),
+/// - the declared `saltLength` is used for verification (PSS verification is
+///   salt-length sensitive).
+///
+/// `trailerField` can only decode to the single defined value (`0xBC`), so
+/// `RsaPssParams` decoding already rejects anything else.
+fn verify_pss_signature(
+    signed_attrs_der: &[u8],
+    signature: &[u8],
+    spki_der: &[u8],
+    signature_algorithm: &AlgorithmIdentifierOwned,
+    digest_alg: DigestAlgorithm,
+) -> Result<(), TrustError> {
+    use crate::crypto::verify::verify_rsa_pss_signature_with_salt;
+    use rsa::pkcs1::RsaPssParams;
+
+    /// id-mgf1 (1.2.840.113549.1.1.8).
+    const OID_MGF1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.8");
+
+    // RFC 4055: the parameters are REQUIRED for RSASSA-PSS; without them the
+    // hash/MGF/salt are undefined for our purposes.
+    let params_any = signature_algorithm.parameters.as_ref().ok_or_else(|| {
+        TrustError::UnsupportedAlgorithm(
+            "RSASSA-PSS signatureAlgorithm is missing its required parameters".into(),
+        )
+    })?;
+    let params_der = params_any.to_der().map_err(|e| {
+        TrustError::SignatureVerification(format!("failed to re-encode RSASSA-PSS parameters: {e}"))
+    })?;
+    let params = RsaPssParams::try_from(params_der.as_slice()).map_err(|e| {
+        TrustError::SignatureVerification(format!("failed to decode RSASSA-PSS parameters: {e}"))
+    })?;
+
+    // The PSS hash must be one we support and must match digestAlgorithm.
+    let pss_hash = DigestAlgorithm::from_oid(&params.hash.oid).ok_or_else(|| {
+        TrustError::UnsupportedAlgorithm(format!(
+            "unsupported RSASSA-PSS hashAlgorithm OID: {}",
+            params.hash.oid
+        ))
+    })?;
+    if pss_hash != digest_alg {
+        return Err(TrustError::SignatureVerification(format!(
+            "RSASSA-PSS hashAlgorithm ({}) disagrees with SignerInfo.digestAlgorithm ({})",
+            pss_hash.name(),
+            digest_alg.name(),
+        )));
+    }
+
+    // maskGenAlgorithm must be MGF1 keyed to the same hash.
+    if params.mask_gen.oid != OID_MGF1 {
+        return Err(TrustError::UnsupportedAlgorithm(format!(
+            "unsupported RSASSA-PSS maskGenAlgorithm OID: {}",
+            params.mask_gen.oid
+        )));
+    }
+    let mgf1_hash_oid = params.mask_gen.parameters.as_ref().map(|h| h.oid);
+    if mgf1_hash_oid != Some(params.hash.oid) {
+        return Err(TrustError::UnsupportedAlgorithm(format!(
+            "RSASSA-PSS MGF1 hash ({}) differs from the message hash ({}); not supported",
+            mgf1_hash_oid
+                .map(|o| o.to_string())
+                .unwrap_or_else(|| "absent".into()),
+            params.hash.oid,
+        )));
+    }
+
+    let salt_len = params.salt_len as usize;
+    match digest_alg {
+        DigestAlgorithm::Sha256 => verify_rsa_pss_signature_with_salt::<sha2::Sha256>(
+            signed_attrs_der,
+            signature,
+            spki_der,
+            salt_len,
+        ),
+        DigestAlgorithm::Sha384 => verify_rsa_pss_signature_with_salt::<sha2::Sha384>(
+            signed_attrs_der,
+            signature,
+            spki_der,
+            salt_len,
+        ),
+        DigestAlgorithm::Sha512 => verify_rsa_pss_signature_with_salt::<sha2::Sha512>(
+            signed_attrs_der,
+            signature,
+            spki_der,
+            salt_len,
+        ),
+        other => Err(TrustError::UnsupportedAlgorithm(format!(
+            "RSASSA-PSS with digest {other:?}"
+        ))),
+    }
+}
+
+/// For a *combined* signature-algorithm OID (one that bakes in the hash, e.g.
+/// `sha256WithRSAEncryption` or `ecdsa-with-SHA256`), return the digest it
+/// encodes. Returns `None` for OIDs that carry no separate hash we model here
+/// (Ed25519, or legacy SHA-1/MD5/SHA-224 forms outside our digest set).
+fn combined_oid_digest(oid: &ObjectIdentifier) -> Option<DigestAlgorithm> {
+    use const_oid::db;
+    if *oid == db::rfc5912::SHA_256_WITH_RSA_ENCRYPTION || *oid == db::rfc5912::ECDSA_WITH_SHA_256 {
+        Some(DigestAlgorithm::Sha256)
+    } else if *oid == db::rfc5912::SHA_384_WITH_RSA_ENCRYPTION
+        || *oid == db::rfc5912::ECDSA_WITH_SHA_384
+    {
+        Some(DigestAlgorithm::Sha384)
+    } else if *oid == db::rfc5912::SHA_512_WITH_RSA_ENCRYPTION
+        || *oid == db::rfc5912::ECDSA_WITH_SHA_512
+    {
+        Some(DigestAlgorithm::Sha512)
+    } else {
+        None
+    }
 }
 
 /// Require that `cert` carries the `id-kp-timeStamping` EKU, marked critical,
@@ -1745,6 +1874,21 @@ mod tests {
         assert!(matches!(err, TspError::InvalidResponse(_)));
     }
 
+    /// Build an RSASSA-PSS `signatureAlgorithm` (OID + `RSASSA-PSS-params`) for
+    /// the given hash and salt length, mirroring what a TSA emits.
+    fn pss_algid<D>(salt_len: u8) -> AlgorithmIdentifierOwned
+    where
+        D: const_oid::AssociatedOid,
+    {
+        use rsa::pkcs1::RsaPssParams;
+        let params = RsaPssParams::new::<D>(salt_len);
+        let params_der = params.to_der().unwrap();
+        AlgorithmIdentifierOwned {
+            oid: OID_RSASSA_PSS,
+            parameters: Some(der::Any::from_der(&params_der).unwrap()),
+        }
+    }
+
     #[test]
     fn test_pss_signature_bound_to_signerinfo_digest() {
         use rsa::pkcs8::EncodePublicKey;
@@ -1759,22 +1903,119 @@ mod tests {
             .as_bytes()
             .to_vec();
 
-        // Sign with RSA-PSS / SHA-256.
+        // Sign with RSA-PSS / SHA-256 using the default salt length (= 32).
         let signing = SigningKey::<Sha256>::new(key);
         let msg = b"the DER-encoded signed attributes";
         let mut rng = rand::thread_rng();
         let sig = signing.sign_with_rng(&mut rng, msg).to_vec();
 
+        let algid = pss_algid::<Sha256>(32);
+
         // Verification bound to SHA-256 (matching SignerInfo.digestAlgorithm) succeeds.
-        verify_cms_signature(msg, &sig, &spki_der, &OID_RSASSA_PSS, DigestAlgorithm::Sha256)
+        verify_cms_signature(msg, &sig, &spki_der, &algid, DigestAlgorithm::Sha256)
             .expect("PSS-SHA256 signature must verify when bound to SHA-256");
 
         // Verification bound to a different digest must NOT accept the signature
         // (previously the code tried multiple hashes and could mis-accept).
         assert!(
-            verify_cms_signature(msg, &sig, &spki_der, &OID_RSASSA_PSS, DigestAlgorithm::Sha384)
-                .is_err(),
+            verify_cms_signature(msg, &sig, &spki_der, &algid, DigestAlgorithm::Sha384).is_err(),
             "PSS signature must be rejected when the bound digest does not match"
+        );
+    }
+
+    #[test]
+    fn test_pss_signature_honours_nondefault_salt_length() {
+        // Regression: PSS verification must use the saltLength from
+        // RSASSA-PSS-params, not assume the default (= digest size). A token
+        // signed with a non-default salt length must still verify.
+        use rsa::pkcs8::EncodePublicKey;
+        use rsa::pss::SigningKey;
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+        use sha2::Sha256;
+
+        let key = tsa_key();
+        let spki_der = rsa::RsaPublicKey::from(&key)
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+
+        // Sign with a 48-byte salt (default for SHA-256 is 32).
+        let signing = SigningKey::<Sha256>::new_with_salt_len(key, 48);
+        let msg = b"the DER-encoded signed attributes";
+        let mut rng = rand::thread_rng();
+        let sig = signing.sign_with_rng(&mut rng, msg).to_vec();
+
+        // With the matching saltLength in the params, verification succeeds.
+        let algid = pss_algid::<Sha256>(48);
+        verify_cms_signature(msg, &sig, &spki_der, &algid, DigestAlgorithm::Sha256)
+            .expect("PSS signature with non-default salt must verify when params declare it");
+
+        // Declaring the wrong (default) salt length must fail: the parameters
+        // are authoritative and PSS verification is salt-length sensitive.
+        let wrong = pss_algid::<Sha256>(32);
+        assert!(
+            verify_cms_signature(msg, &sig, &spki_der, &wrong, DigestAlgorithm::Sha256).is_err(),
+            "PSS signature must not verify when the declared salt length is wrong"
+        );
+    }
+
+    #[test]
+    fn test_pss_signature_requires_parameters() {
+        // A bare RSASSA-PSS OID with no parameters is non-compliant (RFC 4055):
+        // the hash/MGF/salt are undefined, so reject rather than guess defaults.
+        let bare = AlgorithmIdentifierOwned {
+            oid: OID_RSASSA_PSS,
+            parameters: None,
+        };
+        let err =
+            verify_cms_signature(b"x", b"y", b"z", &bare, DigestAlgorithm::Sha256).unwrap_err();
+        assert!(
+            matches!(err, TrustError::UnsupportedAlgorithm(_)),
+            "PSS without parameters must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_combined_sig_algorithm_hash_must_match_digest_algorithm() {
+        // Regression: a token whose signatureAlgorithm encodes a different hash
+        // than SignerInfo.digestAlgorithm must be rejected, even though both the
+        // signature and the message-digest attribute would individually verify.
+        use const_oid::db;
+        use rsa::pkcs1v15::{Signature, SigningKey};
+        use rsa::pkcs8::EncodePublicKey;
+        use rsa::signature::{SignatureEncoding, Signer};
+        use sha2::Sha256;
+
+        let key = tsa_key();
+        let spki_der = rsa::RsaPublicKey::from(&key)
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+
+        // A genuine sha256WithRSAEncryption signature.
+        let signing = SigningKey::<Sha256>::new(key);
+        let msg = b"the DER-encoded signed attributes";
+        let sig: Signature = signing.sign(msg);
+        let sig = sig.to_vec();
+
+        let algid = AlgorithmIdentifierOwned {
+            oid: db::rfc5912::SHA_256_WITH_RSA_ENCRYPTION,
+            parameters: None,
+        };
+
+        // Consistent: signatureAlgorithm hash == digestAlgorithm -> verifies.
+        verify_cms_signature(msg, &sig, &spki_der, &algid, DigestAlgorithm::Sha256)
+            .expect("sha256WithRSA must verify when digestAlgorithm is SHA-256");
+
+        // Inconsistent: digestAlgorithm = SHA-512 but signatureAlgorithm encodes
+        // SHA-256. Must be rejected up front, not silently accepted.
+        let err = verify_cms_signature(msg, &sig, &spki_der, &algid, DigestAlgorithm::Sha512)
+            .unwrap_err();
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("disagrees")),
+            "mismatched signatureAlgorithm/digestAlgorithm must be rejected, got {err:?}"
         );
     }
 

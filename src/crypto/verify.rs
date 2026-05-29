@@ -155,12 +155,38 @@ pub fn verify_rsa_signature<D: digest::Digest + const_oid::AssociatedOid>(
 }
 
 /// Verify an RSA-PSS (RSASSA-PSS) signature over `tbs` using the given SPKI.
+///
+/// Uses the default salt length (the digest output size). Callers that have
+/// decoded the `RSASSA-PSS-params` saltLength should use
+/// [`verify_rsa_pss_signature_with_salt`] instead, since PSS verification is
+/// salt-length sensitive.
 pub fn verify_rsa_pss_signature<
     D: digest::Digest + digest::FixedOutputReset + Default + Clone + Send + Sync + 'static,
 >(
     tbs: &[u8],
     sig: &[u8],
     spki_der: &[u8],
+) -> Result<(), TrustError> {
+    verify_rsa_pss_signature_with_salt::<D>(tbs, sig, spki_der, <D as digest::Digest>::output_size())
+}
+
+/// Verify an RSA-PSS (RSASSA-PSS) signature over `tbs` with an explicit salt
+/// length.
+///
+/// PSS verification is sensitive to the salt length: the value recovered from
+/// the signature must equal `salt_len`. RFC 4055 carries the salt length in the
+/// `RSASSA-PSS-params` of the signature `AlgorithmIdentifier`, so a compliant
+/// verifier must use that value rather than assuming the default. The mask
+/// generation function is MGF1 keyed to the same hash `D` (the only form this
+/// verifier and the underlying `rsa` crate support); callers are responsible
+/// for rejecting parameters that disagree.
+pub fn verify_rsa_pss_signature_with_salt<
+    D: digest::Digest + digest::FixedOutputReset + Default + Clone + Send + Sync + 'static,
+>(
+    tbs: &[u8],
+    sig: &[u8],
+    spki_der: &[u8],
+    salt_len: usize,
 ) -> Result<(), TrustError> {
     use der::Decode;
     use rsa::pss::Pss;
@@ -173,7 +199,7 @@ pub fn verify_rsa_pss_signature<
         .map_err(|e| TrustError::SignatureVerification(format!("RSA key decode failed: {e}")))?;
 
     let hash = D::digest(tbs);
-    let scheme = Pss::new::<D>();
+    let scheme = Pss::new_with_salt::<D>(salt_len);
     pub_key
         .verify(scheme, &hash, sig)
         .map_err(|e| TrustError::SignatureVerification(format!("RSA-PSS signature invalid: {e}")))
