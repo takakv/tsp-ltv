@@ -364,9 +364,20 @@ pub fn verify_timestamp_token(
     if let Some(store) = trust_store {
         // Build the chain [signer, intermediate, ...] from embedded certs and
         // verify it reaches a trust anchor. verify_chain performs the actual
-        // signature checks on every link, so name-based ordering is safe.
+        // signature checks on every link, so the ordering is safe.
         let chain = order_chain(&verified.signer, &verified.embedded);
-        store.verify_chain(&chain, validation_time).map_err(|e| {
+
+        // Default the chain validation time to the token's authenticated
+        // genTime. verify_chain skips intermediate/anchor time-validity checks
+        // when validation_time is None, so falling back to genTime ensures the
+        // chain is assessed as of the moment the timestamp was created (the
+        // correct instant for archival validation) rather than not at all.
+        let effective_time = match validation_time {
+            Some(t) => Some(t),
+            None => Some(gen_time_datetime(&tst_info)?),
+        };
+
+        store.verify_chain(&chain, effective_time).map_err(|e| {
             TspError::VerificationFailed(format!(
                 "TSA certificate does not chain to a trust anchor: {e}"
             ))
@@ -727,39 +738,62 @@ fn eku_contains(eku_der: &[u8], target: &ObjectIdentifier) -> bool {
     false
 }
 
-/// Order embedded certificates into a chain `[signer, issuer, ...]` by name,
-/// stopping at a self-signed certificate or when no issuer is found. The actual
-/// signature checks are performed by [`TrustStore::verify_chain`].
+/// Order embedded certificates into a chain `[signer, issuer, ...]`.
+///
+/// For each step, candidates are matched by subject==issuer name and then the
+/// one whose public key actually verifies the current certificate's signature
+/// is preferred. This avoids picking the wrong certificate when several
+/// embedded certs share a subject name (e.g. re-issued intermediates), which
+/// would otherwise make a valid chain fail in [`TrustStore::verify_chain`]. If
+/// no candidate verifies, the first name match is used so verify_chain still
+/// produces a meaningful error.
 fn order_chain(signer: &Certificate, embedded: &[Certificate]) -> Vec<Certificate> {
     let mut chain = vec![signer.clone()];
     // Bounded to avoid loops on adversarial inputs.
     for _ in 0..16 {
-        let current = chain.last().unwrap();
+        let current = chain.last().unwrap().clone();
         if current.tbs_certificate.issuer == current.tbs_certificate.subject {
             break; // reached a self-signed cert
         }
-        let next = embedded.iter().find(|c| {
-            c.tbs_certificate.subject == current.tbs_certificate.issuer
-                && !chain
-                    .iter()
-                    .any(|existing| existing.tbs_certificate == c.tbs_certificate)
-        });
-        match next {
-            Some(c) => chain.push(c.clone()),
+        let candidates: Vec<&Certificate> = embedded
+            .iter()
+            .filter(|c| {
+                c.tbs_certificate.subject == current.tbs_certificate.issuer
+                    && !chain
+                        .iter()
+                        .any(|existing| existing.tbs_certificate == c.tbs_certificate)
+            })
+            .collect();
+
+        // Prefer a candidate whose key actually signed `current`.
+        let chosen = candidates
+            .iter()
+            .find(|c| {
+                crate::crypto::verify::verify_certificate_signature(&current, c).is_ok()
+            })
+            .or_else(|| candidates.first());
+
+        match chosen {
+            Some(c) => chain.push((*c).clone()),
             None => break,
         }
     }
     chain
 }
 
+/// Decode the timestamp's `genTime` (GeneralizedTime) to a `der::DateTime`.
+fn gen_time_datetime(tst_info: &TstInfo) -> Result<der::DateTime, TspError> {
+    // gen_time_der holds the GeneralizedTime *contents*; re-wrap to decode.
+    let gt_tlv = der_utils::encode_tlv(0x18, &tst_info.gen_time_der);
+    Ok(der::asn1::GeneralizedTime::from_der(&gt_tlv)
+        .map_err(|e| TspError::VerificationFailed(format!("invalid genTime: {e}")))?
+        .to_date_time())
+}
+
 /// Confirm the timestamp's `genTime` falls within the signer certificate's
 /// validity window (RFC 3161).
 fn check_gen_time_within_validity(signer: &Certificate, tst_info: &TstInfo) -> Result<(), TspError> {
-    // gen_time_der holds the GeneralizedTime *contents*; re-wrap to decode.
-    let gt_tlv = der_utils::encode_tlv(0x18, &tst_info.gen_time_der);
-    let gen_time = der::asn1::GeneralizedTime::from_der(&gt_tlv)
-        .map_err(|e| TspError::VerificationFailed(format!("invalid genTime: {e}")))?
-        .to_date_time();
+    let gen_time = gen_time_datetime(tst_info)?;
 
     let validity = &signer.tbs_certificate.validity;
     let not_before = validity.not_before.to_date_time();
@@ -1143,14 +1177,13 @@ mod tests {
     };
     use der::asn1::{Any, SetOfVec};
     use der::{Decode, Tag};
+    use rsa::pkcs8::DecodePrivateKey;
+    use rsa::RsaPrivateKey;
     use spki::AlgorithmIdentifierOwned;
+    use std::sync::OnceLock;
     use x509_cert::attr::Attribute;
     use x509_cert::Certificate;
 
-    const TSA_CERT_PEM: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tsa_cert.pem"));
-    const TSA_KEY_PEM: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tsa_key.pem"));
     const INTERMEDIATE_CERT_PEM: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/intermediate_ca_cert.pem"
@@ -1167,11 +1200,91 @@ mod tests {
         Certificate::from_der(&der).unwrap()
     }
 
+    fn load_key(pem: &str) -> RsaPrivateKey {
+        let der = pem_rfc7468::decode_vec(pem.as_bytes()).unwrap().1;
+        RsaPrivateKey::from_pkcs8_der(&der).unwrap()
+    }
+
+    fn intermediate_cert() -> Certificate {
+        load_cert(INTERMEDIATE_CERT_PEM)
+    }
+
+    fn intermediate_key() -> RsaPrivateKey {
+        load_key(INTERMEDIATE_KEY_PEM)
+    }
+
+    /// A TSA signing identity (certificate + private key) generated at runtime,
+    /// so no private key is committed to the repository. The certificate carries
+    /// a critical id-kp-timeStamping EKU and is issued by the committed
+    /// intermediate CA, so it chains to the committed test root.
+    struct TsaIdentity {
+        cert: Certificate,
+        key: RsaPrivateKey,
+    }
+
+    fn tsa_identity() -> &'static TsaIdentity {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::Keypair;
+        use sha2::Sha256;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::SubjectPublicKeyInfoOwned;
+        use x509_cert::time::Validity;
+
+        static ID: OnceLock<TsaIdentity> = OnceLock::new();
+        ID.get_or_init(|| {
+            // Generate the TSA keypair at runtime.
+            let mut rng = rand::thread_rng();
+            let tsa_key = RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
+            let tsa_signing = SigningKey::<Sha256>::new(tsa_key.clone());
+            let spki = SubjectPublicKeyInfoOwned::from_key(tsa_signing.verifying_key())
+                .expect("SPKI from key");
+
+            // Issue the TSA cert from the committed intermediate CA.
+            let issuer = intermediate_cert();
+            let ca_signer = SigningKey::<Sha256>::new(intermediate_key());
+            let profile = Profile::Leaf {
+                issuer: issuer.tbs_certificate.subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            };
+            let serial = SerialNumber::new(&[0x2A]).unwrap();
+            // Valid 2026..2036-ish; genTime fixtures (2030) fall inside this.
+            let validity =
+                Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
+            let subject: Name = "CN=Runtime Test TSA,O=tsp-ltv tests".parse().unwrap();
+
+            let mut builder =
+                CertificateBuilder::new(profile, serial, validity, subject, spki, &ca_signer)
+                    .expect("cert builder");
+            // Critical because the EKU set does not include anyExtendedKeyUsage.
+            builder
+                .add_extension(&ExtendedKeyUsage(vec![ID_KP_TIME_STAMPING]))
+                .expect("add EKU");
+            let cert = builder
+                .build::<rsa::pkcs1v15::Signature>()
+                .expect("sign cert");
+
+            TsaIdentity { cert, key: tsa_key }
+        })
+    }
+
+    fn tsa_cert() -> Certificate {
+        tsa_identity().cert.clone()
+    }
+
+    fn tsa_key() -> RsaPrivateKey {
+        tsa_identity().key.clone()
+    }
+
     const SHA256_OID_DER: &[u8] = &[
         0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
     ];
 
-    /// genTime inside the TSA cert validity (2026..2036).
+    /// genTime inside the TSA cert validity. The runtime cert is valid from
+    /// "now" for ~10 years, so a near-future fixed instant is safely inside.
     const GEN_TIME_VALID: &[u8] = b"20300101000000Z";
 
     /// Build a DER-encoded TSTInfo with the given message imprint hash, nonce,
@@ -1196,21 +1309,21 @@ mod tests {
     }
 
     /// Build a fully-formed CMS TimeStampToken (ContentInfo/SignedData) signed
-    /// with `signer_key_pem`, embedding `signer_cert_pem` plus `extra_certs`.
+    /// by `signer_key`, embedding `signer_cert` plus `extra_certs`.
     ///
     /// If `corrupt_sig` is true, the signature is computed over the wrong bytes
     /// so the token's signature will not verify.
     fn build_signed_token(
-        signer_cert_pem: &str,
-        signer_key_pem: &str,
-        extra_certs: &[&str],
+        signer_cert: &Certificate,
+        signer_key: &RsaPrivateKey,
+        extra_certs: &[Certificate],
         hash: &[u8],
         nonce: u64,
         corrupt_sig: bool,
     ) -> Vec<u8> {
         build_signed_token_gt(
-            signer_cert_pem,
-            signer_key_pem,
+            signer_cert,
+            signer_key,
             extra_certs,
             hash,
             nonce,
@@ -1223,20 +1336,18 @@ mod tests {
     /// genTime-within-validity check.
     #[allow(clippy::too_many_arguments)]
     fn build_signed_token_gt(
-        signer_cert_pem: &str,
-        signer_key_pem: &str,
-        extra_certs: &[&str],
+        signer_cert: &Certificate,
+        signer_key: &RsaPrivateKey,
+        extra_certs: &[Certificate],
         hash: &[u8],
         nonce: u64,
         gen_time_bytes: &[u8],
         corrupt_sig: bool,
     ) -> Vec<u8> {
         use rsa::pkcs1v15::{Signature, SigningKey};
-        use rsa::pkcs8::DecodePrivateKey;
-        use rsa::signature::{Signer, SignatureEncoding};
+        use rsa::signature::{SignatureEncoding, Signer};
         use sha2::{Digest, Sha256};
 
-        let signer_cert = load_cert(signer_cert_pem);
         let tst_info_der = build_tst_info(hash, nonce, gen_time_bytes);
 
         // Signed attributes: content-type = id-ct-TSTInfo, message-digest = SHA256(eContent)
@@ -1256,9 +1367,7 @@ mod tests {
 
         // Sign the DER of the SET OF signed attributes (RFC 5652 §5.4).
         let signed_attrs_der = signed_attrs.to_der().unwrap();
-        let key_der = pem_rfc7468::decode_vec(signer_key_pem.as_bytes()).unwrap().1;
-        let private_key = rsa::RsaPrivateKey::from_pkcs8_der(&key_der).unwrap();
-        let signing_key = SigningKey::<Sha256>::new(private_key);
+        let signing_key = SigningKey::<Sha256>::new(signer_key.clone());
         let to_sign: &[u8] = if corrupt_sig { b"not the signed attributes" } else { &signed_attrs_der };
         let signature: Signature = signing_key.sign(to_sign);
 
@@ -1284,9 +1393,9 @@ mod tests {
         };
 
         // Embedded certificates: signer first, then any extras.
-        let mut cert_choices = vec![CertificateChoices::Certificate(signer_cert)];
-        for pem in extra_certs {
-            cert_choices.push(CertificateChoices::Certificate(load_cert(pem)));
+        let mut cert_choices = vec![CertificateChoices::Certificate(signer_cert.clone())];
+        for cert in extra_certs {
+            cert_choices.push(CertificateChoices::Certificate(cert.clone()));
         }
 
         let signed_data = cms::signed_data::SignedData {
@@ -1318,7 +1427,7 @@ mod tests {
     fn test_verify_valid_token_no_trust_store() {
         let hash = vec![0xABu8; 32];
         let nonce = 0xDEAD_BEEFu64;
-        let token = build_signed_token(TSA_CERT_PEM, TSA_KEY_PEM, &[], &hash, nonce, false);
+        let token = build_signed_token(&tsa_cert(), &tsa_key(), &[], &hash, nonce, false);
 
         let tst = verify_timestamp_token(
             &token,
@@ -1339,9 +1448,9 @@ mod tests {
         let nonce = 7u64;
         // Embed the intermediate so the chain reaches the root anchor.
         let token = build_signed_token(
-            TSA_CERT_PEM,
-            TSA_KEY_PEM,
-            &[INTERMEDIATE_CERT_PEM],
+            &tsa_cert(),
+            &tsa_key(),
+            &[intermediate_cert()],
             &hash,
             nonce,
             false,
@@ -1364,13 +1473,42 @@ mod tests {
     }
 
     #[test]
+    fn test_trust_store_validation_time_defaults_to_gen_time() {
+        // With a trust store but validation_time = None, the chain must still be
+        // verified using the token's genTime (not skipped). genTime is 2030,
+        // within every cert's validity, so this must succeed.
+        let hash = vec![0x88u8; 32];
+        let token = build_signed_token(
+            &tsa_cert(),
+            &tsa_key(),
+            &[intermediate_cert()],
+            &hash,
+            1,
+            false,
+        );
+        let mut store = TrustStore::new();
+        let (_, root_der) = pem_rfc7468::decode_vec(ROOT_CERT_PEM.as_bytes()).unwrap();
+        store.add_der_certificate(&root_der).unwrap();
+
+        verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            None,
+            Some(&store),
+            None, // -> defaults to genTime
+        )
+        .expect("chain must verify at genTime when validation_time is None");
+    }
+
+    #[test]
     fn test_reject_gen_time_outside_validity_without_trust_store() {
         // genTime in 2050 is past the TSA cert's notAfter (~2036). This must be
         // rejected even when no trust store is supplied (RFC 3161 requirement).
         let hash = vec![0x77u8; 32];
         let token = build_signed_token_gt(
-            TSA_CERT_PEM,
-            TSA_KEY_PEM,
+            &tsa_cert(),
+            &tsa_key(),
             &[],
             &hash,
             1,
@@ -1388,7 +1526,7 @@ mod tests {
     #[test]
     fn test_reject_tampered_signature() {
         let hash = vec![0x22u8; 32];
-        let token = build_signed_token(TSA_CERT_PEM, TSA_KEY_PEM, &[], &hash, 1, true);
+        let token = build_signed_token(&tsa_cert(), &tsa_key(), &[], &hash, 1, true);
         let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None)
             .unwrap_err();
         assert!(
@@ -1401,8 +1539,14 @@ mod tests {
     fn test_reject_untrusted_root() {
         // Token is validly signed but the trust store does NOT contain the root.
         let hash = vec![0x33u8; 32];
-        let token =
-            build_signed_token(TSA_CERT_PEM, TSA_KEY_PEM, &[INTERMEDIATE_CERT_PEM], &hash, 1, false);
+        let token = build_signed_token(
+            &tsa_cert(),
+            &tsa_key(),
+            &[intermediate_cert()],
+            &hash,
+            1,
+            false,
+        );
         let empty_store = TrustStore::new();
         let err = verify_timestamp_token(
             &token,
@@ -1426,7 +1570,7 @@ mod tests {
         // id-kp-timeStamping EKU, so verification must fail.
         let hash = vec![0x44u8; 32];
         let token =
-            build_signed_token(INTERMEDIATE_CERT_PEM, INTERMEDIATE_KEY_PEM, &[], &hash, 1, false);
+            build_signed_token(&intermediate_cert(), &intermediate_key(), &[], &hash, 1, false);
         let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None)
             .unwrap_err();
         assert!(
@@ -1485,7 +1629,7 @@ mod tests {
         // Validly signed, but the caller expected a different hash than the one
         // in the (authenticated) TSTInfo.
         let real_hash = vec![0x66u8; 32];
-        let token = build_signed_token(TSA_CERT_PEM, TSA_KEY_PEM, &[], &real_hash, 1, false);
+        let token = build_signed_token(&tsa_cert(), &tsa_key(), &[], &real_hash, 1, false);
         let expected = vec![0x99u8; 32];
         let err = verify_timestamp_token(&token, &expected, DigestAlgorithm::Sha256, None, None, None)
             .unwrap_err();
