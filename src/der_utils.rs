@@ -219,8 +219,8 @@ pub fn parse_basic_constraints(ext_value: &[u8]) -> Result<(bool, Option<u64>), 
     // error, not a silently-skipped field — otherwise a truncated cA/pathLen
     // could bypass pathLen enforcement.
     if !pos.is_empty() {
-        let (t, value, rest) = parse_tlv_with_rest(pos)
-            .map_err(|e| format!("basicConstraints cA: {e}"))?;
+        let (t, value, rest) =
+            parse_tlv_with_rest(pos).map_err(|e| format!("basicConstraints cA: {e}"))?;
         if t == 0x01 {
             // A BOOLEAN's contents are exactly one byte; zero or multiple bytes
             // is malformed and must fail closed (else a CA flag could be
@@ -250,9 +250,8 @@ pub fn parse_basic_constraints(ext_value: &[u8]) -> Result<(bool, Option<u64>), 
                     "basicConstraints: pathLenConstraint present without cA:TRUE".to_string(),
                 );
             }
-            path_len = Some(
-                decode_integer_u64(value).map_err(|e| format!("pathLenConstraint: {e}"))?,
-            );
+            path_len =
+                Some(decode_integer_u64(value).map_err(|e| format!("pathLenConstraint: {e}"))?);
         }
     }
 
@@ -460,7 +459,10 @@ mod tests {
         let bc = encode_sequence_from_parts(&[&encode_boolean(true), &encode_integer_u64(2)]);
         assert_eq!(parse_basic_constraints(&bc).unwrap(), (true, Some(2)));
         // Empty SEQUENCE → CA:FALSE, no pathlen.
-        assert_eq!(parse_basic_constraints(&[0x30, 0x00]).unwrap(), (false, None));
+        assert_eq!(
+            parse_basic_constraints(&[0x30, 0x00]).unwrap(),
+            (false, None)
+        );
         // cA only.
         let bc = encode_sequence_from_parts(&[&encode_boolean(true)]);
         assert_eq!(parse_basic_constraints(&bc).unwrap(), (true, None));

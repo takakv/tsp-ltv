@@ -1120,24 +1120,28 @@ fn validate_responder_trust(
 ) -> Result<(), LtvError> {
     // Check the responder certificate's own validity period (M-6).
     let validity = &responder_cert.tbs_certificate.validity;
-    let not_before = validity
-        .not_before
-        .to_date_time();
-    let not_after = validity
-        .not_after
-        .to_date_time();
+    let not_before = validity.not_before.to_date_time();
+    let not_after = validity.not_after.to_date_time();
     // Convert der::DateTime to chrono for comparison
     let nb = chrono::DateTime::parse_from_rfc3339(&format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        not_before.year(), { not_before.month() }, { not_before.day() },
-        { not_before.hour() }, { not_before.minutes() }, { not_before.seconds() }
+        not_before.year(),
+        { not_before.month() },
+        { not_before.day() },
+        { not_before.hour() },
+        { not_before.minutes() },
+        { not_before.seconds() }
     ))
     .map_err(|e| LtvError::Ocsp(format!("invalid responder notBefore: {e}")))?
     .with_timezone(&chrono::Utc);
     let na = chrono::DateTime::parse_from_rfc3339(&format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        not_after.year(), { not_after.month() }, { not_after.day() },
-        { not_after.hour() }, { not_after.minutes() }, { not_after.seconds() }
+        not_after.year(),
+        { not_after.month() },
+        { not_after.day() },
+        { not_after.hour() },
+        { not_after.minutes() },
+        { not_after.seconds() }
     ))
     .map_err(|e| LtvError::Ocsp(format!("invalid responder notAfter: {e}")))?
     .with_timezone(&chrono::Utc);

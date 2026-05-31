@@ -399,7 +399,11 @@ impl TrustStore {
             // constraint bounds the number of CA certificates that may *follow*
             // this CA toward the leaf in a valid path. The certs below this
             // issuer are `chain[0..=i]`.
-            enforce_path_len(issuer_cert, &chain[0..=i], &format!("intermediate index {}", i + 1))?;
+            enforce_path_len(
+                issuer_cert,
+                &chain[0..=i],
+                &format!("intermediate index {}", i + 1),
+            )?;
         }
 
         // The last cert in the chain must be issued by a trust anchor

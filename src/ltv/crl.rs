@@ -1493,10 +1493,7 @@ mod tests {
         let crl_der = build_crl_with_extension(&[0x55, 0x1D, 0x1C]);
         let err = parse_crl(&crl_der).expect_err("partitioned CRL must be rejected");
         let msg = format!("{err}");
-        assert!(
-            msg.contains("partitioned CRL"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("partitioned CRL"), "unexpected error: {msg}");
     }
 
     #[test]
@@ -1916,15 +1913,20 @@ mod tests {
             "0.0.0.0",
             "100.64.0.1", // CGNAT
             "::1",
-            "fc00::1",  // unique local
-            "fe80::1",  // link-local
+            "fc00::1",          // unique local
+            "fe80::1",          // link-local
             "::ffff:127.0.0.1", // IPv4-mapped loopback
         ];
         for s in blocked {
             let ip: IpAddr = s.parse().unwrap();
             assert!(is_disallowed_ip(ip), "{s} should be disallowed");
         }
-        let allowed = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"];
+        let allowed = [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+        ];
         for s in allowed {
             let ip: IpAddr = s.parse().unwrap();
             assert!(!is_disallowed_ip(ip), "{s} should be allowed");

@@ -70,8 +70,7 @@ pub const OID_ECDSA_WITH_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("
 // ── DigestAlgorithm ─────────────────────────────────────────────────────
 
 /// Supported digest (hash) algorithms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DigestAlgorithm {
     #[default]
     Sha256,
@@ -189,7 +188,6 @@ impl DigestAlgorithm {
         ]
     }
 }
-
 
 impl std::fmt::Display for DigestAlgorithm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -184,8 +184,8 @@ pub fn check_basic_constraints(cert: &Certificate) -> Result<(bool, Option<u32>)
 
     // Delegate to the shared, feature-independent byte parser so trust-chain
     // pathLen enforcement and ltv extension validation share one implementation.
-    let (is_ca, path_len) = der_utils::parse_basic_constraints(ext_value)
-        .map_err(LtvError::X509Extension)?;
+    let (is_ca, path_len) =
+        der_utils::parse_basic_constraints(ext_value).map_err(LtvError::X509Extension)?;
     // This helper's public API is `u32`; reject (rather than silently truncate)
     // a pathLenConstraint that does not fit.
     let path_len = match path_len {
