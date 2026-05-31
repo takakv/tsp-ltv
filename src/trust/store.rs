@@ -24,6 +24,10 @@ fn basic_constraints(cert: &Certificate) -> Result<(bool, Option<u64>), TrustErr
     Ok((false, None))
 }
 
+fn is_self_issued(cert: &Certificate) -> bool {
+    cert.tbs_certificate.subject == cert.tbs_certificate.issuer
+}
+
 /// Enforce `issuer`'s `pathLenConstraint` against the CA certificates in
 /// `below` (the certificates subordinate to it in the chain). `label`
 /// identifies the issuer in error messages. A parse failure of any
@@ -41,23 +45,24 @@ fn enforce_path_len(
     let Some(max_depth) = path_len else {
         return Ok(());
     };
-    // Count the CA certificates below this issuer. A CA leaf is counted (the
+    // RFC 5280 counts only non-self-issued CA certificates below the
+    // constrained issuer. A CA leaf is counted when it is not self-issued (the
     // chain is generic leaf-to-anchor, so `below[0]` is not assumed to be an
-    // end-entity); an end-entity leaf contributes nothing.
-    let mut subordinate_ca_count = 0usize;
+    // end-entity); a self-issued rollover CA does not consume the budget.
+    let mut subordinate_ca_count = 0u64;
     for cert in below {
         let (is_ca, _) = basic_constraints(cert).map_err(|e| {
             TrustError::SignatureVerification(format!(
                 "failed to parse basicConstraints below {label}: {e}"
             ))
         })?;
-        if is_ca {
+        if is_ca && !is_self_issued(cert) {
             subordinate_ca_count += 1;
         }
     }
-    if subordinate_ca_count > max_depth as usize {
+    if subordinate_ca_count > max_depth {
         return Err(TrustError::SignatureVerification(format!(
-            "pathLenConstraint ({max_depth}) exceeded for {label}: {subordinate_ca_count} subordinate CA certs below"
+            "pathLenConstraint ({max_depth}) exceeded for {label}: {subordinate_ca_count} non-self-issued subordinate CA certs below"
         )));
     }
     Ok(())
@@ -781,5 +786,57 @@ mod tests {
         store
             .verify_chain(&chain, None)
             .expect("anchor pathLen=2 with two CAs below must be accepted");
+    }
+
+    /// Build a chain containing a self-issued CA certificate below a root
+    /// anchor. Self-issued rollover CAs do not consume pathLenConstraint.
+    fn self_issued_ca_below_anchor(root_plen: Option<u8>) -> (TrustStore, Vec<Certificate>) {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::RsaPrivateKey;
+        use sha2::Sha256;
+        use x509_cert::builder::Profile;
+        use x509_cert::name::Name;
+
+        let mut rng = rand::thread_rng();
+        let root_key = RsaPrivateKey::new(&mut rng, 2048).expect("root key");
+        let rollover_key = RsaPrivateKey::new(&mut rng, 2048).expect("rollover key");
+
+        let root_signer = SigningKey::<Sha256>::new(root_key.clone());
+
+        let root_name = "CN=Rollover Root,O=tsp-ltv tests";
+        let root_issuer: Name = root_name.parse().unwrap();
+
+        let root = issue_cert(
+            Profile::SubCA {
+                issuer: root_issuer.clone(),
+                path_len_constraint: root_plen,
+            },
+            root_name,
+            &root_key,
+            &root_signer,
+        );
+        let rollover = issue_cert(
+            Profile::SubCA {
+                issuer: root_issuer,
+                path_len_constraint: None,
+            },
+            root_name,
+            &rollover_key,
+            &root_signer,
+        );
+
+        let mut store = TrustStore::new();
+        store.add_certificate(root).unwrap();
+        (store, vec![rollover])
+    }
+
+    #[test]
+    fn test_verify_chain_pathlen_ignores_self_issued_ca_below_anchor() {
+        // A self-issued rollover CA below the anchor does not consume the
+        // anchor's pathLen budget, so pathLen=0 remains valid.
+        let (store, chain) = self_issued_ca_below_anchor(Some(0));
+        store
+            .verify_chain(&chain, None)
+            .expect("self-issued CA below anchor must not consume pathLenConstraint");
     }
 }

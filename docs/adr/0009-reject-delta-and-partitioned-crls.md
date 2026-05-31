@@ -35,16 +35,17 @@ it carries either marker. The `[0]` is `EXPLICIT`, so its body is the inner
 `Extensions ::= SEQUENCE OF Extension` TLV; that SEQUENCE is unwrapped first so
 the OID scan iterates over individual `Extension` entries rather than mistaking
 the wrapping SEQUENCE for a single (OID-less) extension. A small helper,
-`find_extn_by_oid`, then walks the extension list and returns the `extnValue`
-for a target OID:
+`extensions_contain_oid`, then walks the extension list and treats a matched
+marker OID as present based on the OID alone, so a malformed or missing
+`extnValue` still fails closed:
 
 ```rust
 let (seq_tag, extensions_body, _) = parse_tlv_with_rest(wrap_body)?; // unwrap [0] EXPLICIT
 if seq_tag == 0x30 {
-    if find_extn_by_oid(extensions_body, DELTA_CRL_INDICATOR_OID).is_some() {
+  if extensions_contain_oid(extensions_body, DELTA_CRL_INDICATOR_OID)? {
         return Err(LtvError::Crl("delta CRL (2.5.29.27) not supported; ...".into()));
     }
-    if find_extn_by_oid(extensions_body, ISSUING_DIST_POINT_OID).is_some() {
+  if extensions_contain_oid(extensions_body, ISSUING_DIST_POINT_OID)? {
         return Err(LtvError::Crl("partitioned CRL (IssuingDistributionPoint) not supported; ...".into()));
     }
 }

@@ -30,8 +30,8 @@ classic chain-constraint bypass.
 Enforce `pathLenConstraint` in `verify_chain` for every CA whose constraint
 governs the path. A shared helper, `enforce_path_len(issuer, below, label)`,
 reads `issuer`'s `BasicConstraints` and, when a constraint is present, counts the
-CA certificates among `below` and rejects the chain when that count exceeds the
-constraint:
+non-self-issued CA certificates among `below` and rejects the chain when that
+count exceeds the constraint:
 
 ```rust
 fn enforce_path_len(issuer, below, label) -> Result<(), TrustError> {
@@ -39,18 +39,21 @@ fn enforce_path_len(issuer, below, label) -> Result<(), TrustError> {
     let Some(max_depth) = path_len else { return Ok(()) };
     let mut subordinate_ca_count = 0;
     for cert in below {
-        if basic_constraints(cert)?.0 { subordinate_ca_count += 1; } // count CA certs
+    if basic_constraints(cert)?.0 && cert.subject != cert.issuer {
+      subordinate_ca_count += 1;
     }
-    if subordinate_ca_count > max_depth as usize { /* reject */ }
+    }
+  if subordinate_ca_count > max_depth { /* reject */ }
     Ok(())
 }
 ```
 
-The count is the number of **CA** certificates among the certs subordinate to
-the issuer. `verify_chain` is generic leaf-to-anchor, so the bottom certificate
-is **not** assumed to be an end-entity — a CA leaf (e.g. validating a chain like
-`[intermediate_ca, root]`) is counted, while an end-entity leaf contributes
-nothing.
+The count is the number of **non-self-issued CA** certificates among the certs
+subordinate to the issuer. `verify_chain` is generic leaf-to-anchor, so the
+bottom certificate is **not** assumed to be an end-entity — a CA leaf (e.g.
+validating a chain like `[intermediate_ca, root]`) is counted when it is not
+self-issued, while an end-entity leaf contributes nothing and a self-issued
+rollover CA does not consume the path-length budget.
 
 The helper is applied at two points:
 
@@ -90,10 +93,10 @@ same `der_utils` parser, so there is a single parsing implementation.
   verified despite violating a CA's path-length budget now fail.
 - Correctly-issued chains are unaffected — a CA without `pathLenConstraint`
   (the field is optional) imposes no limit, exactly as before.
-- The count is over CA certificates below the constrained issuer (per RFC 5280),
-  so an end-entity leaf contributes nothing while a *CA* leaf is correctly
-  counted — closing the undercount that a fixed `count = i` shortcut would have
-  on a leaf-is-CA chain such as `[intermediate_ca, root]`.
+- The count is over non-self-issued CA certificates below the constrained
+  issuer (per RFC 5280), so an end-entity leaf contributes nothing, a
+  non-self-issued *CA* leaf is correctly counted, and a self-issued rollover CA
+  does not cause an over-rejection.
 - The check now also covers TSP-only consumers: a timestamp token whose
   certificate chain violates a CA's `pathLenConstraint` is rejected even when the
   crate is built without the `ltv` feature.
