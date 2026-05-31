@@ -251,6 +251,15 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
         match stag {
             // statusString PKIFreeText ::= SEQUENCE SIZE (1..MAX) OF UTF8String
             0x30 => {
+                // PKIFreeText is SIZE (1..MAX): a present-but-empty SEQUENCE
+                // violates the constraint, so reject it rather than silently
+                // accepting it and leaving `status_string` as None (L-6).
+                if sbody.is_empty() {
+                    return Err(TspError::InvalidResponse(
+                        "statusString PKIFreeText SEQUENCE is empty (violates SIZE (1..MAX))"
+                            .into(),
+                    ));
+                }
                 // EVERY element MUST be a UTF8String (tag 0x0C) carrying valid
                 // UTF-8 — not only the first. Reject any other ASN.1 type and
                 // reject invalid UTF-8 rather than lossily normalizing it (L-6).
@@ -1436,6 +1445,26 @@ mod tests {
         assert!(
             matches!(err, TspError::InvalidResponse(ref m) if m.contains("UTF8String")),
             "expected UTF8String rejection of the trailing element, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_timestamp_response_rejects_empty_status_string() {
+        // L-6 (PR review): PKIFreeText is SEQUENCE SIZE (1..MAX) OF UTF8String.
+        // A present-but-empty statusString SEQUENCE violates the size constraint
+        // and must be rejected rather than silently leaving status_string None.
+        let status_int = der_utils::encode_integer_u64(2); // rejection
+        let free_text = der_utils::encode_sequence_raw(&[]); // empty SEQUENCE
+        let mut status_body = status_int;
+        status_body.extend_from_slice(&free_text);
+        let status_info = der_utils::encode_sequence_raw(&status_body);
+        let resp_der = der_utils::encode_sequence_raw(&status_info);
+
+        let err = parse_timestamp_response(&resp_der)
+            .expect_err("an empty statusString SEQUENCE must be rejected");
+        assert!(
+            matches!(err, TspError::InvalidResponse(ref m) if m.contains("empty")),
+            "expected empty-PKIFreeText rejection, got {err:?}"
         );
     }
 

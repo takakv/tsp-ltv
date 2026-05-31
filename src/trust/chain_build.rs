@@ -139,6 +139,17 @@ pub fn build_chain_from_pool_with_policy(
     Ok(chain)
 }
 
+/// Convenience: extract the DER-encoded subject names from a [`TrustStore`](super::TrustStore).
+///
+/// This is useful for passing to [`build_chain_from_pool`] as the
+/// `trust_anchor_subjects` argument.
+pub fn trust_anchor_subjects(store: &super::TrustStore) -> Vec<Vec<u8>> {
+    store
+        .certificates()
+        .filter_map(|cert| cert.tbs_certificate.subject.to_der().ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,15 +270,4 @@ mod tests {
         .expect("legacy build must succeed on a SHA-1 link");
         assert_eq!(chain.len(), 2, "chain should be [leaf, issuer]");
     }
-}
-
-/// Convenience: extract the DER-encoded subject names from a [`TrustStore`](super::TrustStore).
-///
-/// This is useful for passing to [`build_chain_from_pool`] as the
-/// `trust_anchor_subjects` argument.
-pub fn trust_anchor_subjects(store: &super::TrustStore) -> Vec<Vec<u8>> {
-    store
-        .certificates()
-        .filter_map(|cert| cert.tbs_certificate.subject.to_der().ok())
-        .collect()
 }

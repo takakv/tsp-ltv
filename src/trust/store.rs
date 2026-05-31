@@ -50,8 +50,9 @@ fn key_cert_sign(cert: &Certificate) -> Result<Option<bool>, TrustError> {
 /// The parse is strict — a malformed encoding is a hard error, kept distinct
 /// from the semantic "keyCertSign not set" (`Ok(false)`): the value must be a
 /// single BIT STRING with no trailing bytes, a valid unused-bits count (0..=7),
-/// and at least one content octet (RFC 5280 §4.2.1.3 requires keyUsage to
-/// assert at least one bit, so a content-less BIT STRING is rejected).
+/// all unused bits in the final octet set to 0 (DER, X.690 §11.2.1), and at
+/// least one content octet (RFC 5280 §4.2.1.3 requires keyUsage to assert at
+/// least one bit, so a content-less BIT STRING is rejected).
 fn parse_key_cert_sign_bit(extn_value: &[u8]) -> Result<bool, TrustError> {
     // keyUsage is a BIT STRING: first content byte is the unused-bit count,
     // followed by the bit bytes (MSB-first). keyCertSign is bit 5.
@@ -83,6 +84,19 @@ fn parse_key_cert_sign_bit(extn_value: &[u8]) -> Result<bool, TrustError> {
         return Err(TrustError::CertificateParse(
             "keyUsage: BIT STRING has no content octets (no key-usage bits set)".into(),
         ));
+    }
+    // DER (X.690 §11.2.1): every unused bit in the final octet MUST be 0.
+    // A non-zero pad is a malformed encoding and is rejected rather than
+    // silently masked, keeping encoding errors distinct from the semantic
+    // "keyCertSign not set" case.
+    if unused_bits > 0 {
+        let last = bit_bytes[bit_bytes.len() - 1];
+        let pad_mask = (1u8 << unused_bits) - 1;
+        if last & pad_mask != 0 {
+            return Err(TrustError::CertificateParse(format!(
+                "keyUsage: BIT STRING has {unused_bits} non-zero unused bit(s) (not valid DER)"
+            )));
+        }
     }
     // bit 5 → byte 0, mask 0b0000_0100 (7 - 5 = 2).
     Ok((bit_bytes[0] >> 2) & 1 == 1)
@@ -955,6 +969,11 @@ mod tests {
         assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x00])).is_err());
         // Invalid unused-bits count (>7) is rejected.
         assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x08, 0x04])).is_err());
+        // Non-zero unused bits in the final octet are invalid DER (X.690
+        // §11.2.1) and rejected: unused=1 but the low bit of 0x05 is set.
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x01, 0x05])).is_err());
+        // keyCertSign bit set *and* a clean (zero) unused-bit pad still parses.
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x01, 0x06])).unwrap());
     }
 
     #[test]

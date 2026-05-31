@@ -300,16 +300,15 @@ mod tests {
 
         let mut available_certs = vec![signer_cert.clone()];
 
-        // Parse chain PEM which may contain intermediate certs
+        // Parse chain PEM which may contain intermediate certs.
+        // pem_rfc7468::decode_vec doesn't return remaining data, so we only get
+        // the first cert this way. For proper multi-PEM parsing we'd need to
+        // find the next BEGIN marker.
         let pem_data = chain_pem.as_bytes();
-        while let Ok((_label, der)) = pem_rfc7468::decode_vec(pem_data) {
+        if let Ok((_label, der)) = pem_rfc7468::decode_vec(pem_data) {
             if let Ok(cert) = Certificate::from_der(&der) {
                 available_certs.push(cert);
             }
-            // pem_rfc7468::decode_vec doesn't return remaining data,
-            // so we only get the first cert this way. For proper multi-PEM
-            // parsing we'd need to find the next BEGIN marker.
-            break;
         }
 
         let chain =

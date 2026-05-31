@@ -82,15 +82,14 @@ enum EcdsaHash {
     Sha512,
 }
 
-/// Determine the NIST curve a public key is defined over by decoding its SPKI
-/// `AlgorithmIdentifier`. Requires `id-ecPublicKey` with a recognized
+/// Determine the NIST curve a public key is defined over from its already-parsed
+/// SPKI `AlgorithmIdentifier`. Requires `id-ecPublicKey` with a recognized
 /// named-curve OID parameter; anything else is rejected.
-fn ec_named_curve(spki_der: &[u8]) -> Result<EcCurve, TrustError> {
-    use der::Decode;
-    use spki::SubjectPublicKeyInfoRef;
-
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
+///
+/// Takes the parsed [`spki::SubjectPublicKeyInfoRef`] (rather than raw DER) so
+/// the dispatcher can decode the SPKI exactly once and reuse it for both curve
+/// detection and key construction, instead of decoding it twice per signature.
+fn ec_named_curve(spki: &spki::SubjectPublicKeyInfoRef<'_>) -> Result<EcCurve, TrustError> {
     if spki.algorithm.oid != OID_EC_PUBLIC_KEY {
         return Err(TrustError::SignatureVerification(format!(
             "ECDSA signature but SPKI algorithm is not id-ecPublicKey (got {})",
@@ -132,19 +131,23 @@ fn verify_ecdsa_bound(
     spki_der: &[u8],
     hash: EcdsaHash,
 ) -> Result<(), TrustError> {
-    let curve = ec_named_curve(spki_der)?;
+    use der::Decode;
+    use spki::SubjectPublicKeyInfoRef;
+
+    // Decode the SPKI once and reuse it for both curve detection and key
+    // construction; the per-curve helpers below take the parsed ref so a
+    // successful verification performs a single SPKI decode, not two.
+    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
+        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
+    let curve = ec_named_curve(&spki)?;
     match (curve, hash) {
-        (EcCurve::P256, EcdsaHash::Sha256) => verify_ecdsa_p256_signature(tbs, sig, spki_der),
-        (EcCurve::P384, EcdsaHash::Sha384) => verify_ecdsa_p384_signature(tbs, sig, spki_der),
-        (EcCurve::P521, EcdsaHash::Sha512) => verify_ecdsa_p521_signature(tbs, sig, spki_der),
-        (EcCurve::P521, EcdsaHash::Sha256) => {
-            verify_ecdsa_p521_sha256_signature(tbs, sig, spki_der)
-        }
-        (EcCurve::P521, EcdsaHash::Sha384) => {
-            verify_ecdsa_p521_sha384_signature(tbs, sig, spki_der)
-        }
-        (EcCurve::P256, EcdsaHash::Sha1) => verify_ecdsa_p256_sha1_signature(tbs, sig, spki_der),
-        (EcCurve::P384, EcdsaHash::Sha1) => verify_ecdsa_p384_sha1_signature(tbs, sig, spki_der),
+        (EcCurve::P256, EcdsaHash::Sha256) => verify_ecdsa_p256_spki(spki, tbs, sig),
+        (EcCurve::P384, EcdsaHash::Sha384) => verify_ecdsa_p384_spki(spki, tbs, sig),
+        (EcCurve::P521, EcdsaHash::Sha512) => verify_ecdsa_p521_spki(spki, tbs, sig),
+        (EcCurve::P521, EcdsaHash::Sha256) => verify_ecdsa_p521_sha256_spki(spki, tbs, sig),
+        (EcCurve::P521, EcdsaHash::Sha384) => verify_ecdsa_p521_sha384_spki(spki, tbs, sig),
+        (EcCurve::P256, EcdsaHash::Sha1) => verify_ecdsa_p256_sha1_spki(spki, tbs, sig),
+        (EcCurve::P384, EcdsaHash::Sha1) => verify_ecdsa_p384_sha1_spki(spki, tbs, sig),
         (curve, hash) => Err(TrustError::SignatureVerification(format!(
             "ECDSA curve {curve:?} is not a supported pairing with the declared {hash:?} hash"
         ))),
@@ -594,18 +597,29 @@ pub fn verify_rsa_pss_signature_with_salt<
         .map_err(|e| TrustError::SignatureVerification(format!("RSA-PSS signature invalid: {e}")))
 }
 
+/// Decode an SPKI from raw DER for the public single-shot ECDSA verifiers.
+fn decode_spki(spki_der: &[u8]) -> Result<spki::SubjectPublicKeyInfoRef<'_>, TrustError> {
+    use der::Decode;
+    spki::SubjectPublicKeyInfoRef::from_der(spki_der)
+        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))
+}
+
 /// Verify an ECDSA P-256 (SHA-256) signature.
 pub fn verify_ecdsa_p256_signature(
     tbs: &[u8],
     sig: &[u8],
     spki_der: &[u8],
 ) -> Result<(), TrustError> {
-    use der::Decode;
-    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-    use spki::SubjectPublicKeyInfoRef;
+    verify_ecdsa_p256_spki(decode_spki(spki_der)?, tbs, sig)
+}
 
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
+fn verify_ecdsa_p256_spki(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    tbs: &[u8],
+    sig: &[u8],
+) -> Result<(), TrustError> {
+    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+
     let vk = VerifyingKey::try_from(spki)
         .map_err(|e| TrustError::SignatureVerification(format!("P-256 key decode failed: {e}")))?;
     let signature = Signature::from_der(sig)
@@ -621,12 +635,16 @@ pub fn verify_ecdsa_p384_signature(
     sig: &[u8],
     spki_der: &[u8],
 ) -> Result<(), TrustError> {
-    use der::Decode;
-    use p384::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-    use spki::SubjectPublicKeyInfoRef;
+    verify_ecdsa_p384_spki(decode_spki(spki_der)?, tbs, sig)
+}
 
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
+fn verify_ecdsa_p384_spki(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    tbs: &[u8],
+    sig: &[u8],
+) -> Result<(), TrustError> {
+    use p384::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+
     let vk = VerifyingKey::try_from(spki)
         .map_err(|e| TrustError::SignatureVerification(format!("P-384 key decode failed: {e}")))?;
     let signature = Signature::from_der(sig)
@@ -642,13 +660,17 @@ pub fn verify_ecdsa_p521_signature(
     sig: &[u8],
     spki_der: &[u8],
 ) -> Result<(), TrustError> {
-    use der::Decode;
+    verify_ecdsa_p521_spki(decode_spki(spki_der)?, tbs, sig)
+}
+
+fn verify_ecdsa_p521_spki(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    tbs: &[u8],
+    sig: &[u8],
+) -> Result<(), TrustError> {
     use ecdsa::signature::hazmat::PrehashVerifier;
     use sha2::Digest as _;
-    use spki::SubjectPublicKeyInfoRef;
 
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
     let vk = ecdsa::VerifyingKey::<p521::NistP521>::try_from(spki)
         .map_err(|e| TrustError::SignatureVerification(format!("P-521 key decode failed: {e}")))?;
     let signature = ecdsa::Signature::<p521::NistP521>::from_der(sig)
@@ -671,13 +693,17 @@ pub fn verify_ecdsa_p521_sha256_signature(
     sig: &[u8],
     spki_der: &[u8],
 ) -> Result<(), TrustError> {
-    use der::Decode;
+    verify_ecdsa_p521_sha256_spki(decode_spki(spki_der)?, tbs, sig)
+}
+
+fn verify_ecdsa_p521_sha256_spki(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    tbs: &[u8],
+    sig: &[u8],
+) -> Result<(), TrustError> {
     use ecdsa::signature::hazmat::PrehashVerifier;
     use sha2::Digest as _;
-    use spki::SubjectPublicKeyInfoRef;
 
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
     let vk = ecdsa::VerifyingKey::<p521::NistP521>::try_from(spki)
         .map_err(|e| TrustError::SignatureVerification(format!("P-521 key decode failed: {e}")))?;
     let signature = ecdsa::Signature::<p521::NistP521>::from_der(sig)
@@ -698,13 +724,17 @@ pub fn verify_ecdsa_p521_sha384_signature(
     sig: &[u8],
     spki_der: &[u8],
 ) -> Result<(), TrustError> {
-    use der::Decode;
+    verify_ecdsa_p521_sha384_spki(decode_spki(spki_der)?, tbs, sig)
+}
+
+fn verify_ecdsa_p521_sha384_spki(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    tbs: &[u8],
+    sig: &[u8],
+) -> Result<(), TrustError> {
     use ecdsa::signature::hazmat::PrehashVerifier;
     use sha2::Digest as _;
-    use spki::SubjectPublicKeyInfoRef;
 
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
     let vk = ecdsa::VerifyingKey::<p521::NistP521>::try_from(spki)
         .map_err(|e| TrustError::SignatureVerification(format!("P-521 key decode failed: {e}")))?;
     let signature = ecdsa::Signature::<p521::NistP521>::from_der(sig)
@@ -721,13 +751,17 @@ pub fn verify_ecdsa_p256_sha1_signature(
     sig: &[u8],
     spki_der: &[u8],
 ) -> Result<(), TrustError> {
-    use der::Decode;
+    verify_ecdsa_p256_sha1_spki(decode_spki(spki_der)?, tbs, sig)
+}
+
+fn verify_ecdsa_p256_sha1_spki(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    tbs: &[u8],
+    sig: &[u8],
+) -> Result<(), TrustError> {
     use ecdsa::signature::hazmat::PrehashVerifier;
     use sha1::Digest as _;
-    use spki::SubjectPublicKeyInfoRef;
 
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
     let vk = p256::ecdsa::VerifyingKey::try_from(spki)
         .map_err(|e| TrustError::SignatureVerification(format!("P-256 key decode failed: {e}")))?;
     let signature = p256::ecdsa::Signature::from_der(sig)
@@ -745,13 +779,17 @@ pub fn verify_ecdsa_p384_sha1_signature(
     sig: &[u8],
     spki_der: &[u8],
 ) -> Result<(), TrustError> {
-    use der::Decode;
+    verify_ecdsa_p384_sha1_spki(decode_spki(spki_der)?, tbs, sig)
+}
+
+fn verify_ecdsa_p384_sha1_spki(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    tbs: &[u8],
+    sig: &[u8],
+) -> Result<(), TrustError> {
     use ecdsa::signature::hazmat::PrehashVerifier;
     use sha1::Digest as _;
-    use spki::SubjectPublicKeyInfoRef;
 
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
     let vk = p384::ecdsa::VerifyingKey::try_from(spki)
         .map_err(|e| TrustError::SignatureVerification(format!("P-384 key decode failed: {e}")))?;
     let signature = p384::ecdsa::Signature::from_der(sig)
@@ -1052,7 +1090,8 @@ mod tests {
             .to_vec();
 
         // ec_named_curve recognizes the P-256 SPKI.
-        assert_eq!(ec_named_curve(&spki_der).unwrap(), EcCurve::P256);
+        let spki = decode_spki(&spki_der).unwrap();
+        assert_eq!(ec_named_curve(&spki).unwrap(), EcCurve::P256);
 
         let msg = b"message bound to a P-256 ECDSA signature";
         let sig: Signature = sk.sign(msg);
@@ -1082,7 +1121,8 @@ mod tests {
         ));
         let ca = load_test_cert(ca_pem);
         let spki_der = der::Encode::to_der(&ca.tbs_certificate.subject_public_key_info).unwrap();
-        let err = ec_named_curve(&spki_der).unwrap_err();
+        let spki = decode_spki(&spki_der).unwrap();
+        let err = ec_named_curve(&spki).unwrap_err();
         assert!(
             matches!(err, TrustError::SignatureVerification(ref m) if m.contains("id-ecPublicKey")),
             "RSA SPKI must be rejected by ec_named_curve, got {err:?}"
