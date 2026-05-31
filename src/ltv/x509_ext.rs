@@ -186,7 +186,15 @@ pub fn check_basic_constraints(cert: &Certificate) -> Result<(bool, Option<u32>)
     // pathLen enforcement and ltv extension validation share one implementation.
     let (is_ca, path_len) = der_utils::parse_basic_constraints(ext_value)
         .map_err(LtvError::X509Extension)?;
-    Ok((is_ca, path_len.map(|p| p as u32)))
+    // This helper's public API is `u32`; reject (rather than silently truncate)
+    // a pathLenConstraint that does not fit.
+    let path_len = match path_len {
+        Some(p) => Some(u32::try_from(p).map_err(|_| {
+            LtvError::X509Extension(format!("pathLenConstraint {p} exceeds u32 range"))
+        })?),
+        None => None,
+    };
+    Ok((is_ca, path_len))
 }
 
 /// Parse the Key Usage extension from a certificate.

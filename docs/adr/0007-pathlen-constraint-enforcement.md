@@ -27,28 +27,43 @@ classic chain-constraint bypass.
 
 ## Decision
 
-Enforce `pathLenConstraint` during the chain walk in `verify_chain`. For each
-issuer certificate `chain[i + 1]`, read its `BasicConstraints` via
-`check_basic_constraints` (which returns `(is_ca, path_len)`). When `path_len`
-is `Some(max_depth)`, compute the number of subordinate CA certificates that
-appear beneath this issuer in the chain — `chain[1..=i]`, i.e. `i` certificates
-(the leaf at `chain[0]` is an end-entity and does not count) — and reject the
-chain when that count exceeds `max_depth`. The count is the number of CA
-certificates in `chain[0..=i]` — `verify_chain` is generic leaf-to-anchor, so
-`chain[0]` is **not** assumed to be an end-entity; a CA leaf (e.g. validating a
-chain like `[intermediate_ca, root]`) is counted:
+Enforce `pathLenConstraint` in `verify_chain` for every CA whose constraint
+governs the path. A shared helper, `enforce_path_len(issuer, below, label)`,
+reads `issuer`'s `BasicConstraints` and, when a constraint is present, counts the
+CA certificates among `below` and rejects the chain when that count exceeds the
+constraint:
 
 ```rust
-let (_is_ca, path_len) = check_basic_constraints(issuer_cert)?;
-if let Some(max_depth) = path_len {
-    let mut subordinate_ca_count = 0usize;
-    for below in &chain[0..=i] {
-        let (below_is_ca, _) = check_basic_constraints(below)?;
-        if below_is_ca { subordinate_ca_count += 1; }
+fn enforce_path_len(issuer, below, label) -> Result<(), TrustError> {
+    let (_is_ca, path_len) = basic_constraints(issuer)?;        // hard error on malformed
+    let Some(max_depth) = path_len else { return Ok(()) };
+    let mut subordinate_ca_count = 0;
+    for cert in below {
+        if basic_constraints(cert)?.0 { subordinate_ca_count += 1; } // count CA certs
     }
     if subordinate_ca_count > max_depth as usize { /* reject */ }
+    Ok(())
 }
 ```
+
+The count is the number of **CA** certificates among the certs subordinate to
+the issuer. `verify_chain` is generic leaf-to-anchor, so the bottom certificate
+is **not** assumed to be an end-entity — a CA leaf (e.g. validating a chain like
+`[intermediate_ca, root]`) is counted, while an end-entity leaf contributes
+nothing.
+
+The helper is applied at two points:
+
+- **For each in-chain issuer** `chain[i + 1]`, against the certs below it,
+  `chain[0..=i]`.
+- **For the matched trust anchor.** The chain builder stops before appending the
+  anchor, so an anchor that lives only in the store is absent from `chain` and
+  its own `pathLenConstraint` would otherwise never be checked. After the anchor
+  verifies `last`'s signature, `enforce_path_len(anchor, chain, "trust anchor")`
+  runs with the *entire* chain as the subordinate set — so a root constrained to
+  `pathLenConstraint = 0` rejects a chain containing a subordinate CA beneath it.
+  (When the chain already includes the self-signed root, the per-issuer pass
+  above has already covered it.)
 
 A parse failure of any `BasicConstraints` on the path (the issuer or a cert
 below it) is itself a chain rejection (`TrustError::SignatureVerification`), not

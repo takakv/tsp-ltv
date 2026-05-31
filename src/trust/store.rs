@@ -24,6 +24,45 @@ fn basic_constraints(cert: &Certificate) -> Result<(bool, Option<u64>), TrustErr
     Ok((false, None))
 }
 
+/// Enforce `issuer`'s `pathLenConstraint` against the CA certificates in
+/// `below` (the certificates subordinate to it in the chain). `label`
+/// identifies the issuer in error messages. A parse failure of any
+/// `BasicConstraints` on the path is a hard error, not a silent skip.
+fn enforce_path_len(
+    issuer: &Certificate,
+    below: &[Certificate],
+    label: &str,
+) -> Result<(), TrustError> {
+    let (_is_ca, path_len) = basic_constraints(issuer).map_err(|e| {
+        TrustError::SignatureVerification(format!(
+            "failed to parse basicConstraints for {label}: {e}"
+        ))
+    })?;
+    let Some(max_depth) = path_len else {
+        return Ok(());
+    };
+    // Count the CA certificates below this issuer. A CA leaf is counted (the
+    // chain is generic leaf-to-anchor, so `below[0]` is not assumed to be an
+    // end-entity); an end-entity leaf contributes nothing.
+    let mut subordinate_ca_count = 0usize;
+    for cert in below {
+        let (is_ca, _) = basic_constraints(cert).map_err(|e| {
+            TrustError::SignatureVerification(format!(
+                "failed to parse basicConstraints below {label}: {e}"
+            ))
+        })?;
+        if is_ca {
+            subordinate_ca_count += 1;
+        }
+    }
+    if subordinate_ca_count > max_depth as usize {
+        return Err(TrustError::SignatureVerification(format!(
+            "pathLenConstraint ({max_depth}) exceeded for {label}: {subordinate_ca_count} subordinate CA certs below"
+        )));
+    }
+    Ok(())
+}
+
 /// A trust anchor: a parsed certificate paired with its DER encoding.
 #[derive(Clone)]
 struct TrustAnchor {
@@ -358,38 +397,9 @@ impl TrustStore {
             // TSP-only token verification reaches `verify_chain` too, so this
             // must not be gated behind `ltv`. Per RFC 5280 §4.2.1.9 the
             // constraint bounds the number of CA certificates that may *follow*
-            // this CA toward the leaf in a valid path.
-            let (_is_ca, path_len) = basic_constraints(issuer_cert).map_err(|e| {
-                TrustError::SignatureVerification(format!(
-                    "failed to parse basicConstraints at intermediate index {}: {e}",
-                    i + 1
-                ))
-            })?;
-            if let Some(max_depth) = path_len {
-                // Count the CA certificates strictly below this issuer in the
-                // chain (`chain[0..=i]`). The leaf is included only when it is
-                // itself a CA — `verify_chain` is generic leaf-to-anchor, so
-                // `chain[0]` is not assumed to be an end-entity (e.g. a chain
-                // like [intermediate_ca, root]).
-                let mut subordinate_ca_count = 0usize;
-                for below in &chain[0..=i] {
-                    let (below_is_ca, _) = basic_constraints(below).map_err(|e| {
-                        TrustError::SignatureVerification(format!(
-                            "failed to parse basicConstraints below intermediate index {}: {e}",
-                            i + 1
-                        ))
-                    })?;
-                    if below_is_ca {
-                        subordinate_ca_count += 1;
-                    }
-                }
-                if subordinate_ca_count > max_depth as usize {
-                    return Err(TrustError::SignatureVerification(format!(
-                        "pathLenConstraint ({max_depth}) exceeded at intermediate index {}: {} subordinate CA certs below",
-                        i + 1, subordinate_ca_count
-                    )));
-                }
-            }
+            // this CA toward the leaf in a valid path. The certs below this
+            // issuer are `chain[0..=i]`.
+            enforce_path_len(issuer_cert, &chain[0..=i], &format!("intermediate index {}", i + 1))?;
         }
 
         // The last cert in the chain must be issued by a trust anchor
@@ -427,6 +437,13 @@ impl TrustStore {
                 last, anchor, policy,
             ) {
                 Ok(()) => {
+                    // Enforce the anchor's own pathLenConstraint. The chain
+                    // builder stops before appending the anchor, so this anchor
+                    // is not in `chain` and its constraint would otherwise never
+                    // be checked. Every certificate in `chain` is subordinate to
+                    // it.
+                    enforce_path_len(anchor, chain, "trust anchor")?;
+
                     // Signature verified — now check anchor time validity
                     if let Some(time) = validation_time {
                         let validity = &anchor.tbs_certificate.validity;
@@ -676,5 +693,89 @@ mod tests {
         store
             .verify_chain(&chain, None)
             .expect("pathLen=1 with one CA leaf below must be accepted");
+    }
+
+    /// Build a chain `[leaf_subca, mid_subca]` that does NOT include the root,
+    /// with the self-signed root anchor carrying `pathLenConstraint = root_plen`.
+    /// The anchor lives only in the store, so its constraint is reached via the
+    /// `find_all_issuers` path rather than the in-chain walk.
+    fn anchor_only_chain(root_plen: Option<u8>) -> (TrustStore, Vec<Certificate>) {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::RsaPrivateKey;
+        use sha2::Sha256;
+        use x509_cert::builder::Profile;
+        use x509_cert::name::Name;
+
+        let mut rng = rand::thread_rng();
+        let root_key = RsaPrivateKey::new(&mut rng, 2048).expect("root key");
+        let mid_key = RsaPrivateKey::new(&mut rng, 2048).expect("mid key");
+        let leaf_key = RsaPrivateKey::new(&mut rng, 2048).expect("leaf key");
+
+        let root_signer = SigningKey::<Sha256>::new(root_key.clone());
+        let mid_signer = SigningKey::<Sha256>::new(mid_key.clone());
+
+        let root_name = "CN=Anchor Root,O=tsp-ltv tests";
+        let mid_name = "CN=Anchor Mid,O=tsp-ltv tests";
+        let leaf_name = "CN=Anchor Leaf CA,O=tsp-ltv tests";
+        let root_issuer: Name = root_name.parse().unwrap();
+        let mid_issuer: Name = mid_name.parse().unwrap();
+
+        // Self-signed root WITH a pathLenConstraint: Profile::Root forces None,
+        // so build it as a SubCA whose issuer is its own name.
+        let root = issue_cert(
+            Profile::SubCA {
+                issuer: root_issuer.clone(),
+                path_len_constraint: root_plen,
+            },
+            root_name,
+            &root_key,
+            &root_signer,
+        );
+        let mid = issue_cert(
+            Profile::SubCA {
+                issuer: root_issuer,
+                path_len_constraint: None,
+            },
+            mid_name,
+            &mid_key,
+            &root_signer,
+        );
+        let leaf = issue_cert(
+            Profile::SubCA {
+                issuer: mid_issuer,
+                path_len_constraint: None,
+            },
+            leaf_name,
+            &leaf_key,
+            &mid_signer,
+        );
+
+        let mut store = TrustStore::new();
+        store.add_certificate(root).unwrap();
+        // Chain stops below the anchor — the root is only in the store.
+        (store, vec![leaf, mid])
+    }
+
+    #[test]
+    fn test_verify_chain_anchor_pathlen_enforced() {
+        // The root anchor (not in the chain) is constrained to pathLen=0 but two
+        // subordinate CAs sit below it. The anchor's constraint must be checked.
+        let (store, chain) = anchor_only_chain(Some(0));
+        let err = store
+            .verify_chain(&chain, None)
+            .expect_err("anchor pathLen=0 with CAs below must be rejected");
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("pathLenConstraint") && m.contains("trust anchor")),
+            "expected trust-anchor pathLenConstraint rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_chain_anchor_pathlen_within_constraint() {
+        // pathLen=2 permits the two subordinate CAs — chain verifies.
+        let (store, chain) = anchor_only_chain(Some(2));
+        store
+            .verify_chain(&chain, None)
+            .expect("anchor pathLen=2 with two CAs below must be accepted");
     }
 }

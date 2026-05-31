@@ -113,7 +113,12 @@ fn default_http_client() -> Client {
             return attempt.error("too many CRL redirects");
         }
         if let Some(host) = attempt.url().host_str() {
-            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            // `host_str()` brackets IPv6 literals (`[::1]`); strip for parsing.
+            let bare = host
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(host);
+            if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
                 if is_disallowed_ip(ip) {
                     // Stop following; the caller sees the 3xx and rejects it.
                     return attempt.stop();
@@ -122,10 +127,13 @@ fn default_http_client() -> Client {
         }
         attempt.follow()
     });
+    // Fail closed: never degrade to a client with reqwest's default (unhardened)
+    // redirect behaviour. A build failure here is a system/TLS fault, on which
+    // `reqwest::Client::new()` would itself panic.
     Client::builder()
         .redirect(policy)
         .build()
-        .unwrap_or_else(|_| Client::new())
+        .expect("failed to build hardened CRL HTTP client")
 }
 
 impl CrlClient {
@@ -575,24 +583,34 @@ const DELTA_CRL_INDICATOR_OID: &[u8] = &[0x55, 0x1D, 0x1B];
 const ISSUING_DIST_POINT_OID: &[u8] = &[0x55, 0x1D, 0x1C];
 
 /// Helper: search for a specific OID in an Extensions SEQUENCE body.
-/// Returns the extnValue OCTET STRING body if found, or None.
-fn find_extn_by_oid<'a>(extensions_body: &'a [u8], target_oid: &[u8]) -> Option<&'a [u8]> {
+///
+/// Returns `Ok(Some(extnValue))` when found, `Ok(None)` when the OID is absent
+/// from a well-formed list, and `Err` when an extension is malformed. A parse
+/// error must **not** be conflated with "not found": a malformed extension
+/// appearing before a `deltaCRLIndicator` / `IssuingDistributionPoint` would
+/// otherwise abort the scan and let a delta/partitioned CRL be accepted as a
+/// full CRL.
+fn find_extn_by_oid<'a>(
+    extensions_body: &'a [u8],
+    target_oid: &[u8],
+) -> Result<Option<&'a [u8]>, String> {
     // Extensions SEQUENCE body: iterate over Extension SEQUENCEs.
     let mut pos = extensions_body;
     while !pos.is_empty() {
-        let (ext_tag, ext_value, rest) = parse_tlv_with_rest(pos).ok()?;
+        let (ext_tag, ext_value, rest) = parse_tlv_with_rest(pos)?;
         if ext_tag != 0x30 {
-            pos = rest;
-            continue;
+            return Err(format!(
+                "expected Extension SEQUENCE (0x30), got 0x{ext_tag:02x}"
+            ));
         }
         // Extension ::= SEQUENCE { extnID OID, ... extnValue OCTET STRING }
-        let (oid_tag, oid_body, ext_rest) = parse_tlv_with_rest(ext_value).ok()?;
+        let (oid_tag, oid_body, ext_rest) = parse_tlv_with_rest(ext_value)?;
         if oid_tag == 0x06 && oid_body == target_oid {
-            return find_tagged_value(ext_rest, 0x04);
+            return Ok(find_tagged_value(ext_rest, 0x04));
         }
         pos = rest;
     }
-    None
+    Ok(None)
 }
 
 /// Parse a DER-encoded CRL into its structural components.
@@ -746,10 +764,15 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
             let (seq_tag, extensions_body, _) = parse_tlv_with_rest(wrap_body)
                 .map_err(|e| LtvError::Crl(format!("crlExtensions SEQUENCE: {e}")))?;
             if seq_tag == 0x30 {
+                // A malformed crlExtensions list is a parse error (fail closed),
+                // not a silent "no such extension" result.
+                let has_delta = find_extn_by_oid(extensions_body, DELTA_CRL_INDICATOR_OID)
+                    .map_err(|e| LtvError::Crl(format!("crlExtensions scan: {e}")))?
+                    .is_some();
                 // Check for delta CRL indicator (2.5.29.27) — reject if present.
                 // Delta CRLs only contain changes since a base CRL; using one as a
                 // complete revocation source would miss entries from the base CRL.
-                if find_extn_by_oid(extensions_body, DELTA_CRL_INDICATOR_OID).is_some() {
+                if has_delta {
                     return Err(LtvError::Crl(
                         "delta CRL (2.5.29.27) not supported; only full CRLs are accepted".into(),
                     ));
@@ -757,7 +780,10 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
                 // Check for IssuingDistributionPoint (2.5.29.28). A partitioned CRL
                 // cannot serve as a complete revocation source for all certs under
                 // the issuer, so we reject it.
-                if find_extn_by_oid(extensions_body, ISSUING_DIST_POINT_OID).is_some() {
+                let has_idp = find_extn_by_oid(extensions_body, ISSUING_DIST_POINT_OID)
+                    .map_err(|e| LtvError::Crl(format!("crlExtensions scan: {e}")))?
+                    .is_some();
+                if has_idp {
                     return Err(LtvError::Crl(
                         "partitioned CRL (IssuingDistributionPoint) not supported; only full CRLs are accepted".into(),
                     ));
@@ -1411,6 +1437,16 @@ mod tests {
     /// tests need no real key. The `[0] EXPLICIT Extensions` wrapping mirrors a
     /// real CRL, exercising the SEQUENCE-unwrap in the OID scan.
     fn build_crl_with_extension(ext_oid: &[u8]) -> Vec<u8> {
+        // Extension ::= SEQUENCE { extnID OID, extnValue OCTET STRING }
+        let oid_tlv = encode_tlv(0x06, ext_oid);
+        let value_tlv = encode_tlv(0x04, &[]); // empty extnValue OCTET STRING
+        let extension = encode_sequence_from_parts(&[&oid_tlv, &value_tlv]);
+        build_crl_with_extensions_body(&extension)
+    }
+
+    /// Like [`build_crl_with_extension`] but takes the raw `Extensions` SEQUENCE
+    /// body verbatim, so tests can inject a malformed extension list.
+    fn build_crl_with_extensions_body(extensions_body: &[u8]) -> Vec<u8> {
         let mut tbs_body = Vec::new();
         // version INTEGER 1 (v2)
         tbs_body.extend_from_slice(&encode_integer_u64(1));
@@ -1426,11 +1462,7 @@ mod tests {
         tbs_body.extend_from_slice(&encode_tlv(0x17, b"260101000000Z"));
         tbs_body.extend_from_slice(&encode_tlv(0x17, b"270101000000Z"));
         // crlExtensions [0] EXPLICIT Extensions ::= SEQUENCE OF Extension
-        // Extension ::= SEQUENCE { extnID OID, extnValue OCTET STRING }
-        let oid_tlv = encode_tlv(0x06, ext_oid);
-        let value_tlv = encode_tlv(0x04, &[]); // empty extnValue OCTET STRING
-        let extension = encode_sequence_from_parts(&[&oid_tlv, &value_tlv]);
-        let extensions_seq = encode_sequence_raw(&extension);
+        let extensions_seq = encode_sequence_raw(extensions_body);
         tbs_body.extend_from_slice(&encode_tlv(0xA0, &extensions_seq));
 
         let tbs_der = encode_sequence_raw(&tbs_body);
@@ -1468,6 +1500,25 @@ mod tests {
         let parsed = parse_crl(&crl_der).expect("benign extension must parse");
         assert!(parsed.revoked_entries.is_empty());
         assert!(parsed.next_update.is_some());
+    }
+
+    #[test]
+    fn test_parse_crl_rejects_malformed_extension_list() {
+        // A malformed extension ahead of any delta/IDP marker must be a parse
+        // error (fail closed), not a silent "not found" that accepts the CRL.
+        // Here: a benign cRLNumber extension followed by a truncated TLV.
+        let benign = encode_sequence_from_parts(&[
+            &encode_tlv(0x06, &[0x55, 0x1D, 0x14]),
+            &encode_tlv(0x04, &[]),
+        ]);
+        let mut extensions_body = benign;
+        extensions_body.extend_from_slice(&[0x30, 0x05, 0x06, 0x03]); // SEQUENCE len 5, truncated
+        let crl_der = build_crl_with_extensions_body(&extensions_body);
+        let err = parse_crl(&crl_der).expect_err("malformed crlExtensions must be rejected");
+        assert!(
+            format!("{err}").contains("crlExtensions scan"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -211,31 +211,31 @@ pub fn parse_basic_constraints(ext_value: &[u8]) -> Result<(bool, Option<u64>), 
             "basicConstraints: expected SEQUENCE (0x30), got 0x{tag:02x}"
         ));
     }
-    if seq_body.is_empty() {
-        return Ok((false, None));
-    }
-
     let mut is_ca = false;
     let mut path_len: Option<u64> = None;
     let mut pos = &seq_body[..];
 
-    // cA BOOLEAN (optional, DEFAULT FALSE)
-    if let Ok((t, value, rest)) = parse_tlv_with_rest(pos) {
+    // cA BOOLEAN (optional, DEFAULT FALSE). A malformed TLV here is a hard
+    // error, not a silently-skipped field — otherwise a truncated cA/pathLen
+    // could bypass pathLen enforcement.
+    if !pos.is_empty() {
+        let (t, value, rest) = parse_tlv_with_rest(pos)
+            .map_err(|e| format!("basicConstraints cA: {e}"))?;
         if t == 0x01 {
             is_ca = !value.is_empty() && value[0] != 0x00;
             pos = rest;
         }
     }
 
-    // pathLenConstraint INTEGER (optional)
+    // pathLenConstraint INTEGER (optional). Likewise fail closed on a malformed
+    // INTEGER rather than treating it as "no constraint".
     if !pos.is_empty() {
-        if let Ok((t, value, _rest)) = parse_tlv_with_rest(pos) {
-            if t == 0x02 {
-                path_len = Some(
-                    decode_integer_u64(value)
-                        .map_err(|e| format!("pathLenConstraint: {e}"))?,
-                );
-            }
+        let (t, value, _rest) = parse_tlv_with_rest(pos)
+            .map_err(|e| format!("basicConstraints pathLenConstraint: {e}"))?;
+        if t == 0x02 {
+            path_len = Some(
+                decode_integer_u64(value).map_err(|e| format!("pathLenConstraint: {e}"))?,
+            );
         }
     }
 
@@ -434,6 +434,45 @@ mod tests {
         // Too large (>8 bytes of significant data)
         assert!(
             decode_integer_u64(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]).is_err()
+        );
+    }
+
+    #[test]
+    fn test_parse_basic_constraints_ok() {
+        // SEQUENCE { BOOLEAN TRUE, INTEGER 2 }
+        let bc = encode_sequence_from_parts(&[&encode_boolean(true), &encode_integer_u64(2)]);
+        assert_eq!(parse_basic_constraints(&bc).unwrap(), (true, Some(2)));
+        // Empty SEQUENCE → CA:FALSE, no pathlen.
+        assert_eq!(parse_basic_constraints(&[0x30, 0x00]).unwrap(), (false, None));
+        // cA only.
+        let bc = encode_sequence_from_parts(&[&encode_boolean(true)]);
+        assert_eq!(parse_basic_constraints(&bc).unwrap(), (true, None));
+    }
+
+    #[test]
+    fn test_parse_basic_constraints_rejects_malformed_child() {
+        // SEQUENCE (len 3) { BOOLEAN tag+len but value byte truncated }.
+        // A swallowed parse error here would let cA/pathLen bypass enforcement.
+        let malformed = [0x30, 0x02, 0x01, 0x01];
+        assert!(parse_basic_constraints(&malformed).is_err());
+        // Truncated pathLen INTEGER after a valid cA BOOLEAN.
+        let mut body = encode_boolean(true);
+        body.extend_from_slice(&[0x02, 0x04, 0x00]); // INTEGER len 4, only 1 byte
+        let seq = encode_sequence_raw(&body);
+        assert!(parse_basic_constraints(&seq).is_err());
+    }
+
+    #[test]
+    fn test_parse_basic_constraints_large_pathlen_not_truncated() {
+        // pathLenConstraint that exceeds u32 must survive as a full u64 (the
+        // u32 narrowing/rejection is the caller's concern, not this parser's).
+        let big = encode_sequence_from_parts(&[
+            &encode_boolean(true),
+            &encode_integer_u64(0x1_0000_0001),
+        ]);
+        assert_eq!(
+            parse_basic_constraints(&big).unwrap(),
+            (true, Some(0x1_0000_0001))
         );
     }
 
