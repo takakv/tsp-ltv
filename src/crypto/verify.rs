@@ -480,10 +480,17 @@ pub fn verify_certificate_signature_with_policy(
     // mismatch means the unauthenticated outer field was altered (e.g. an
     // algorithm-substitution attempt), so reject before any crypto (L-5).
     if cert.signature_algorithm != cert.tbs_certificate.signature {
+        // The equality above covers the full AlgorithmIdentifier (OID *and*
+        // parameters), so the diagnostic must surface both — printing only the
+        // OIDs would misleadingly show the same value twice when the mismatch is
+        // purely in the parameters (e.g. differing RSASSA-PSS parameters).
         return Err(TrustError::SignatureVerification(format!(
-            "certificate outer signatureAlgorithm ({}) does not match the signed \
-             tbsCertificate.signature ({})",
-            cert.signature_algorithm.oid, cert.tbs_certificate.signature.oid
+            "certificate outer signatureAlgorithm (oid={}, params={:?}) does not match \
+             the signed tbsCertificate.signature (oid={}, params={:?})",
+            cert.signature_algorithm.oid,
+            cert.signature_algorithm.parameters,
+            cert.tbs_certificate.signature.oid,
+            cert.tbs_certificate.signature.parameters
         )));
     }
 
