@@ -104,10 +104,12 @@ non-determinative) and is unaffected.
 - `RevocationConfig` gains a `crl_freshness` field (default
   `CrlFreshness::default()`), threaded through `run_crl_check`, mirroring how
   `ocsp_freshness` (ADR 0004) and `signature_policy` (ADR 0003) are threaded. A
-  `with_crl_freshness()` builder (and `with_ocsp_freshness()`) is added.
-  `RevocationConfig` is marked `#[non_exhaustive]` so this field — and future
-  ones — are added without breaking downstream callers, which construct it via
-  `default()`/builders rather than exhaustive struct literals.
+  `with_crl_freshness()` builder (and `with_ocsp_freshness()`) is added, and the
+  type doc steers construction through `..Default::default()` / the builders so
+  callers avoid exhaustive struct literals and keep compiling across field
+  additions. (The struct is intentionally *not* `#[non_exhaustive]`, which would
+  break the common `..Default::default()` struct-update idiom for downstream
+  crates — a larger break than simply adding a field.)
 - `CrlClient` gains a fetch-time `freshness` policy (with a `freshness()`
   builder, default `CrlFreshness::default()`). `fetch_crl` does not serve a
   cached CRL that has crossed its own `nextUpdate` (it re-fetches), and

@@ -201,13 +201,17 @@ impl CrlClient {
     /// returned (→ `Unknown`), unchanged from before.
     pub async fn fetch_crls_for_cert(&self, cert: &Certificate) -> Result<Vec<Vec<u8>>, LtvError> {
         let urls = Self::extract_crl_urls(cert);
-        let now = chrono::Utc::now();
         let mut stale_fallback: Option<Vec<u8>> = None;
 
         for url in &urls {
             match self.fetch_crl(url).await {
                 Ok(crl) => {
-                    if crl_is_current(&crl, now, &self.freshness) {
+                    // Evaluate currentness at the moment this CRL is checked, not
+                    // at a timestamp captured before the (possibly slow) fetches —
+                    // otherwise an endpoint that crosses nextUpdate while earlier
+                    // fetches run could still be returned and then rejected
+                    // downstream, shadowing a later fresh distribution point.
+                    if crl_is_current(&crl, chrono::Utc::now(), &self.freshness) {
                         // Current CRL at this distribution point — authoritative.
                         return Ok(vec![crl]);
                     }

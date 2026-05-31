@@ -56,20 +56,22 @@ use crate::ltv::status::{resolve_priority, ValidationStatus};
 ///
 /// # Construction
 ///
-/// This struct is `#[non_exhaustive]`: construct it from [`RevocationConfig::default`]
-/// (or [`disabled`](RevocationConfig::disabled) / [`strict`](RevocationConfig::strict))
-/// and adjust fields or use the builder methods, e.g.
+/// Build from [`RevocationConfig::default`] (or
+/// [`disabled`](RevocationConfig::disabled) / [`strict`](RevocationConfig::strict))
+/// and override individual fields with struct-update syntax or the builder
+/// methods, e.g.
 ///
 /// ```rust
 /// # use tsp_ltv::ltv::revocation::RevocationConfig;
-/// let mut config = RevocationConfig::default();
-/// config.require_revocation_check = false;
+/// let config = RevocationConfig {
+///     require_revocation_check: false,
+///     ..RevocationConfig::default()
+/// };
 /// ```
 ///
-/// New fields are therefore added without breaking downstream callers — they
-/// never need an exhaustive struct literal.
+/// Using `..Default::default()` (rather than an exhaustive struct literal) keeps
+/// your code compiling when new fields are added in a later version.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct RevocationConfig {
     /// Prefer OCSP over CRL when both are available.
     ///
@@ -473,8 +475,9 @@ async fn run_crl_check(
                     };
                 }
 
-                // Check the first successfully fetched CRL
-                // (fetch_crls_for_cert already stops after the first success).
+                // Check the CRL that `fetch_crls_for_cert` selected: the first
+                // distribution point that downloaded and was current, or — if
+                // none were current — a stale CRL as a fail-closed fallback.
                 // A validation failure on a CRL we actually received (bad
                 // signature, malformed structure, stale/expired window) is a
                 // definitive negative result → Invalid, not Unknown, so a forged
