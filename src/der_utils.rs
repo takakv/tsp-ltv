@@ -222,7 +222,16 @@ pub fn parse_basic_constraints(ext_value: &[u8]) -> Result<(bool, Option<u64>), 
         let (t, value, rest) = parse_tlv_with_rest(pos)
             .map_err(|e| format!("basicConstraints cA: {e}"))?;
         if t == 0x01 {
-            is_ca = !value.is_empty() && value[0] != 0x00;
+            // A BOOLEAN's contents are exactly one byte; zero or multiple bytes
+            // is malformed and must fail closed (else a CA flag could be
+            // mis-counted by the trust-chain pathLen logic).
+            if value.len() != 1 {
+                return Err(format!(
+                    "basicConstraints cA: BOOLEAN must be 1 byte, got {}",
+                    value.len()
+                ));
+            }
+            is_ca = value[0] != 0x00;
             pos = rest;
         }
     }
@@ -233,6 +242,14 @@ pub fn parse_basic_constraints(ext_value: &[u8]) -> Result<(bool, Option<u64>), 
         let (t, value, _rest) = parse_tlv_with_rest(pos)
             .map_err(|e| format!("basicConstraints pathLenConstraint: {e}"))?;
         if t == 0x02 {
+            // RFC 5280 §4.2.1.9: pathLenConstraint is meaningful only when cA is
+            // asserted. Reject `pathLenConstraint` without `cA:TRUE` rather than
+            // returning a constraint for a non-CA certificate.
+            if !is_ca {
+                return Err(
+                    "basicConstraints: pathLenConstraint present without cA:TRUE".to_string(),
+                );
+            }
             path_len = Some(
                 decode_integer_u64(value).map_err(|e| format!("pathLenConstraint: {e}"))?,
             );
@@ -460,6 +477,25 @@ mod tests {
         body.extend_from_slice(&[0x02, 0x04, 0x00]); // INTEGER len 4, only 1 byte
         let seq = encode_sequence_raw(&body);
         assert!(parse_basic_constraints(&seq).is_err());
+    }
+
+    #[test]
+    fn test_parse_basic_constraints_rejects_pathlen_without_ca() {
+        // RFC 5280: pathLenConstraint is only valid with cA:TRUE. A non-CA cert
+        // (cA absent/FALSE) carrying a pathLen is malformed and must be rejected.
+        let bc = encode_sequence_from_parts(&[&encode_integer_u64(0)]); // INTEGER only
+        assert!(parse_basic_constraints(&bc).is_err());
+        let bc = encode_sequence_from_parts(&[&encode_boolean(false), &encode_integer_u64(1)]);
+        assert!(parse_basic_constraints(&bc).is_err());
+    }
+
+    #[test]
+    fn test_parse_basic_constraints_rejects_malformed_ca_boolean() {
+        // BOOLEAN contents must be exactly one byte.
+        let bc = encode_sequence_from_parts(&[&encode_tlv(0x01, &[])]); // zero-length
+        assert!(parse_basic_constraints(&bc).is_err());
+        let bc = encode_sequence_from_parts(&[&encode_tlv(0x01, &[0xFF, 0xFF])]); // two bytes
+        assert!(parse_basic_constraints(&bc).is_err());
     }
 
     #[test]

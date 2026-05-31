@@ -760,35 +760,42 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
         // wrapping SEQUENCE as a single (OID-less) extension.
         let (wrap_tag, wrap_body, _) = parse_tlv_with_rest(tbs_pos)
             .map_err(|e| LtvError::Crl(format!("crlExtensions: {e}")))?;
-        if wrap_tag == 0xA0 {
-            let (seq_tag, extensions_body, _) = parse_tlv_with_rest(wrap_body)
-                .map_err(|e| LtvError::Crl(format!("crlExtensions SEQUENCE: {e}")))?;
-            if seq_tag == 0x30 {
-                // A malformed crlExtensions list is a parse error (fail closed),
-                // not a silent "no such extension" result.
-                let has_delta = find_extn_by_oid(extensions_body, DELTA_CRL_INDICATOR_OID)
-                    .map_err(|e| LtvError::Crl(format!("crlExtensions scan: {e}")))?
-                    .is_some();
-                // Check for delta CRL indicator (2.5.29.27) — reject if present.
-                // Delta CRLs only contain changes since a base CRL; using one as a
-                // complete revocation source would miss entries from the base CRL.
-                if has_delta {
-                    return Err(LtvError::Crl(
-                        "delta CRL (2.5.29.27) not supported; only full CRLs are accepted".into(),
-                    ));
-                }
-                // Check for IssuingDistributionPoint (2.5.29.28). A partitioned CRL
-                // cannot serve as a complete revocation source for all certs under
-                // the issuer, so we reject it.
-                let has_idp = find_extn_by_oid(extensions_body, ISSUING_DIST_POINT_OID)
-                    .map_err(|e| LtvError::Crl(format!("crlExtensions scan: {e}")))?
-                    .is_some();
-                if has_idp {
-                    return Err(LtvError::Crl(
-                        "partitioned CRL (IssuingDistributionPoint) not supported; only full CRLs are accepted".into(),
-                    ));
-                }
-            }
+        // tbs_pos[0] == 0xA0 was checked above, so wrap_tag is 0xA0.
+        debug_assert_eq!(wrap_tag, 0xA0);
+        let (seq_tag, extensions_body, _) = parse_tlv_with_rest(wrap_body)
+            .map_err(|e| LtvError::Crl(format!("crlExtensions SEQUENCE: {e}")))?;
+        // The [0] body must be an Extensions SEQUENCE. Anything else is
+        // malformed and must be rejected (fail closed), not silently skipped —
+        // otherwise a bogus wrapper would bypass delta/partitioned detection.
+        if seq_tag != 0x30 {
+            return Err(LtvError::Crl(format!(
+                "crlExtensions: expected Extensions SEQUENCE (0x30), got 0x{seq_tag:02x}"
+            )));
+        }
+
+        // A malformed crlExtensions list is a parse error (fail closed), not a
+        // silent "no such extension" result.
+        // Check for delta CRL indicator (2.5.29.27) — reject if present. Delta
+        // CRLs only contain changes since a base CRL; using one as a complete
+        // revocation source would miss entries from the base CRL.
+        let has_delta = find_extn_by_oid(extensions_body, DELTA_CRL_INDICATOR_OID)
+            .map_err(|e| LtvError::Crl(format!("crlExtensions scan: {e}")))?
+            .is_some();
+        if has_delta {
+            return Err(LtvError::Crl(
+                "delta CRL (2.5.29.27) not supported; only full CRLs are accepted".into(),
+            ));
+        }
+        // Check for IssuingDistributionPoint (2.5.29.28). A partitioned CRL
+        // cannot serve as a complete revocation source for all certs under the
+        // issuer, so we reject it.
+        let has_idp = find_extn_by_oid(extensions_body, ISSUING_DIST_POINT_OID)
+            .map_err(|e| LtvError::Crl(format!("crlExtensions scan: {e}")))?
+            .is_some();
+        if has_idp {
+            return Err(LtvError::Crl(
+                "partitioned CRL (IssuingDistributionPoint) not supported; only full CRLs are accepted".into(),
+            ));
         }
     }
 
@@ -1500,6 +1507,33 @@ mod tests {
         let parsed = parse_crl(&crl_der).expect("benign extension must parse");
         assert!(parsed.revoked_entries.is_empty());
         assert!(parsed.next_update.is_some());
+    }
+
+    #[test]
+    fn test_parse_crl_rejects_non_sequence_crl_extensions() {
+        // The [0] EXPLICIT body must be an Extensions SEQUENCE. A bogus wrapper
+        // (here an INTEGER inside [0]) must fail closed, not be silently skipped.
+        let mut tbs_body = Vec::new();
+        tbs_body.extend_from_slice(&encode_integer_u64(1));
+        let sha256_rsa_oid: &[u8] = &[
+            0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B,
+        ];
+        let alg_id = encode_sequence_from_parts(&[sha256_rsa_oid, &[0x05, 0x00]]);
+        tbs_body.extend_from_slice(&alg_id);
+        tbs_body.extend_from_slice(&encode_sequence_raw(&[]));
+        tbs_body.extend_from_slice(&encode_tlv(0x17, b"260101000000Z"));
+        tbs_body.extend_from_slice(&encode_tlv(0x17, b"270101000000Z"));
+        // crlExtensions [0] wrapping an INTEGER instead of an Extensions SEQUENCE.
+        tbs_body.extend_from_slice(&encode_tlv(0xA0, &encode_integer_u64(7)));
+        let tbs_der = encode_sequence_raw(&tbs_body);
+        let sig = encode_tlv(0x03, &[0x00, 0xDE, 0xAD]);
+        let crl_der = encode_sequence_from_parts(&[&tbs_der, &alg_id, &sig]);
+
+        let err = parse_crl(&crl_der).expect_err("non-SEQUENCE crlExtensions must be rejected");
+        assert!(
+            format!("{err}").contains("Extensions SEQUENCE"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
