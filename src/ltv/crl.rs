@@ -62,78 +62,16 @@ pub struct CrlClient {
 /// Maximum allowed CRL response body size (10 MiB).
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
-/// Maximum HTTP redirects followed when fetching a CRL.
-const MAX_REDIRECTS: usize = 5;
-
-/// Classify an IPv4 address as non-public (loopback, private, link-local,
-/// unspecified, broadcast, documentation, multicast, or RFC 6598 CGNAT shared
-/// space).
-fn is_disallowed_ipv4(v4: std::net::Ipv4Addr) -> bool {
-    let o = v4.octets();
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_documentation()
-        || v4.is_multicast()
-        // CGNAT shared address space 100.64.0.0/10 (RFC 6598)
-        || (o[0] == 100 && (o[1] & 0xc0) == 0x40)
-}
-
-/// Classify an IP address as non-public, so the CRL SSRF guard can refuse
-/// fetches whose host resolves to an internal or metadata address. IPv4-mapped
-/// IPv6 addresses are unwrapped and re-checked.
-fn is_disallowed_ip(ip: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-    match ip {
-        IpAddr::V4(v4) => is_disallowed_ipv4(v4),
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_disallowed_ipv4(v4);
-            }
-            let first = v6.segments()[0];
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // unique local fc00::/7
-                || (first & 0xfe00) == 0xfc00
-                // link-local unicast fe80::/10
-                || (first & 0xffc0) == 0xfe80
-        }
-    }
-}
-
 /// Build the default CRL HTTP client with a bounded redirect policy that
 /// refuses to follow redirects to literal non-public addresses — complementing
 /// the resolve-time SSRF check in [`CrlClient::validate_url`].
+///
+/// The SSRF controls (address classifier, hardened redirect client, and
+/// pre-egress URL validation) live in [`crate::net`] so the CRL fetch path and
+/// the AIA chain-builder ([`crate::ltv::chain`]) share one implementation
+/// rather than duplicating the logic (ADR-0010).
 fn default_http_client() -> Client {
-    let policy = reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() >= MAX_REDIRECTS {
-            return attempt.error("too many CRL redirects");
-        }
-        if let Some(host) = attempt.url().host_str() {
-            // `host_str()` brackets IPv6 literals (`[::1]`); strip for parsing.
-            let bare = host
-                .strip_prefix('[')
-                .and_then(|h| h.strip_suffix(']'))
-                .unwrap_or(host);
-            if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-                if is_disallowed_ip(ip) {
-                    // Stop following; the caller sees the 3xx and rejects it.
-                    return attempt.stop();
-                }
-            }
-        }
-        attempt.follow()
-    });
-    // Fail closed: never degrade to a client with reqwest's default (unhardened)
-    // redirect behaviour. A build failure here is a system/TLS fault, on which
-    // `reqwest::Client::new()` would itself panic.
-    Client::builder()
-        .redirect(policy)
-        .build()
-        .expect("failed to build hardened CRL HTTP client")
+    crate::net::hardened_http_client()
 }
 
 impl CrlClient {
@@ -195,64 +133,9 @@ impl CrlClient {
     /// the two lookups is not fully prevented. The default client's redirect
     /// policy additionally refuses redirects to literal non-public addresses.
     async fn validate_url(url: &str) -> Result<(), LtvError> {
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|e| LtvError::Crl(format!("invalid CRL URL {url}: {e}")))?;
-        match parsed.scheme() {
-            "http" | "https" => {}
-            other => {
-                return Err(LtvError::Crl(format!(
-                    "CRL URL scheme not allowed: {other} (only http/https are supported)"
-                )))
-            }
-        }
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| LtvError::Crl(format!("CRL URL has no host: {url}")))?;
-        // `host_str()` brackets IPv6 literals (`[::1]`); strip them for parsing.
-        let host_bare = host
-            .strip_prefix('[')
-            .and_then(|h| h.strip_suffix(']'))
-            .unwrap_or(host);
-
-        // A literal IP needs no DNS — check it directly.
-        if let Ok(ip) = host_bare.parse::<std::net::IpAddr>() {
-            if is_disallowed_ip(ip) {
-                return Err(LtvError::Crl(format!(
-                    "CRL host {host_bare} is a non-public address (SSRF guard)"
-                )));
-            }
-            return Ok(());
-        }
-
-        // Hostname: resolve off the async executor and reject any non-public
-        // destination among the resolved addresses.
-        let port = parsed.port_or_known_default().unwrap_or(0);
-        let host_owned = host_bare.to_string();
-        let host_for_lookup = host_owned.clone();
-        let addrs: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
-            use std::net::ToSocketAddrs;
-            (host_for_lookup.as_str(), port)
-                .to_socket_addrs()
-                .map(|it| it.collect::<Vec<_>>())
-        })
-        .await
-        .map_err(|e| LtvError::Crl(format!("DNS resolution task failed: {e}")))?
-        .map_err(|e| LtvError::Crl(format!("failed to resolve CRL host {host_owned}: {e}")))?;
-
-        if addrs.is_empty() {
-            return Err(LtvError::Crl(format!(
-                "CRL host {host_owned} resolved to no addresses"
-            )));
-        }
-        for addr in &addrs {
-            if is_disallowed_ip(addr.ip()) {
-                return Err(LtvError::Crl(format!(
-                    "CRL host {host_owned} resolves to non-public address {} (SSRF guard)",
-                    addr.ip()
-                )));
-            }
-        }
-        Ok(())
+        crate::net::validate_fetch_url(url)
+            .await
+            .map_err(|e| LtvError::Crl(format!("CRL {e}")))
     }
 
     /// Extract CRL distribution point URLs from a certificate.
@@ -1914,6 +1797,7 @@ mod tests {
 
     #[test]
     fn test_is_disallowed_ip_classification() {
+        use crate::net::is_disallowed_ip;
         use std::net::IpAddr;
         let blocked = [
             "127.0.0.1",

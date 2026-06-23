@@ -176,6 +176,131 @@ fn enforce_path_len(
     Ok(())
 }
 
+/// Object identifiers (dotted strings) of the X.509v3 extensions this crate
+/// recognises and processes during chain verification. Per RFC 5280 §4.2 an
+/// unrecognised **critical** extension MUST cause the certificate (and thus the
+/// chain) to be rejected — see [`reject_unknown_critical_extensions`]. An
+/// extension is listed here only if the crate actually understands it:
+///
+/// - `2.5.29.19` basicConstraints — processed by `basic_constraints` /
+///   `enforce_path_len`.
+/// - `2.5.29.15` keyUsage — processed by `key_cert_sign` /
+///   `validate_extensions_for_role`.
+/// - `2.5.29.37` extendedKeyUsage — processed by leaf-purpose binding
+///   (`validate_extensions_for_role`).
+/// - `2.5.29.17` subjectAltName — consumed by name-constraints checking.
+/// - `2.5.29.30` nameConstraints — processed under the `ltv` feature; a
+///   tsp-only build does not process it, so it is intentionally **absent** from
+///   the always-on list and present only in the `ltv` extension below, keeping a
+///   critical nameConstraints fail-closed when name-constraint enforcement is
+///   not compiled in.
+/// - `2.5.29.31` cRLDistributionPoints — consumed by the CRL fetch path.
+/// - `1.3.6.1.5.5.7.1.1` authorityInfoAccess — consumed by the AIA/OCSP path.
+///
+/// `subjectKeyIdentifier` (`2.5.29.14`) and `authorityKeyIdentifier`
+/// (`2.5.29.35`) are not security-load-bearing here, but RFC 5280 mandates they
+/// be **non-critical**, so they never reach the critical check; they are omitted
+/// deliberately (a certificate that marks them critical is malformed and is
+/// rejected — fail closed).
+const RECOGNIZED_CRITICAL_EXT_OIDS: &[&str] = &[
+    "2.5.29.19",         // basicConstraints
+    "2.5.29.15",         // keyUsage
+    "2.5.29.37",         // extendedKeyUsage
+    "2.5.29.17",         // subjectAltName
+    "2.5.29.31",         // cRLDistributionPoints
+    "1.3.6.1.5.5.7.1.1", // authorityInfoAccess
+];
+
+/// Reject a certificate that asserts a **critical** extension this crate does
+/// not recognise (RFC 5280 §4.2: "A certificate-using system MUST reject the
+/// certificate if it encounters a critical extension it does not recognize or
+/// cannot process").
+///
+/// This is feature-independent and runs for every certificate in the chain
+/// (including the anchor) so a tsp-only build is held to the same MUST-reject
+/// rule. The `ltv`-processed `nameConstraints` OID is accepted only when the
+/// `ltv` feature is compiled in; otherwise a critical `nameConstraints` is
+/// unrecognised and the chain is refused — fail closed rather than silently
+/// ignoring a constraint the build cannot enforce.
+fn reject_unknown_critical_extensions(cert: &Certificate, label: &str) -> Result<(), TrustError> {
+    let Some(extensions) = &cert.tbs_certificate.extensions else {
+        return Ok(());
+    };
+    for ext in extensions.iter() {
+        if !ext.critical {
+            continue;
+        }
+        let oid = ext.extn_id.to_string();
+        // `mut` is used only under `ltv` (the nameConstraints branch below);
+        // tsp-only builds never reassign it.
+        #[allow(unused_mut)]
+        let mut recognized = RECOGNIZED_CRITICAL_EXT_OIDS.contains(&oid.as_str());
+        // nameConstraints (2.5.29.30) is only *processed* under the `ltv`
+        // feature; recognise it as critical only when we can enforce it.
+        #[cfg(feature = "ltv")]
+        {
+            if oid == crate::ltv::name_constraints::NAME_CONSTRAINTS_OID {
+                recognized = true;
+            }
+        }
+        if !recognized {
+            return Err(TrustError::SignatureVerification(format!(
+                "{label} has an unrecognized critical extension {oid} (RFC 5280 §4.2 MUST reject)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Enforce RFC 5280 §4.2.1.10 name constraints over a fully-resolved path
+/// `[leaf, intermediate..., anchor]` (the anchor appended last).
+///
+/// Constraints accumulate top-down: starting from the anchor, each CA's
+/// `NameConstraints` extension is folded into the running state and applied to
+/// every certificate **below** it. A subordinate certificate whose subject DN or
+/// a subjectAltName entry falls in an excluded subtree — or outside every
+/// permitted subtree of its type — is rejected. A `NameConstraints` extension
+/// that constrains a GeneralName type this crate does not implement is rejected
+/// as unsupported (fail closed).
+///
+/// Only compiled under `ltv`; a tsp-only build keeps a *critical* nameConstraints
+/// fail-closed via [`reject_unknown_critical_extensions`] instead.
+#[cfg(feature = "ltv")]
+fn enforce_name_constraints_path(path: &[&Certificate]) -> Result<(), TrustError> {
+    use crate::ltv::name_constraints::NameConstraintState;
+
+    let mut state = NameConstraintState::default();
+    // path[last] is the anchor; walk from the anchor (top) down to the leaf.
+    // For each issuer CA, fold its constraints in, then check every certificate
+    // strictly below it.
+    let n = path.len();
+    for top in (1..n).rev() {
+        let issuer = path[top];
+        state
+            .add_from_cert(issuer)
+            .map_err(|e| name_constraint_to_trust_error(issuer, e))?;
+        if state.is_empty() {
+            continue;
+        }
+        // Check every certificate below this issuer (indices 0..top).
+        for sub in path.iter().take(top) {
+            state
+                .check_cert(sub)
+                .map_err(|e| name_constraint_to_trust_error(sub, e))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ltv")]
+fn name_constraint_to_trust_error(
+    cert: &Certificate,
+    e: crate::ltv::name_constraints::NameConstraintError,
+) -> TrustError {
+    let subject = format!("{}", cert.tbs_certificate.subject);
+    TrustError::SignatureVerification(format!("certificate '{subject}': {e}"))
+}
+
 /// A trust anchor: a parsed certificate paired with its DER encoding.
 #[derive(Clone)]
 struct TrustAnchor {
@@ -262,9 +387,21 @@ impl TrustStore {
         Ok(store)
     }
 
-    /// Load trust anchors from all PEM files (*.pem, *.crt, *.cer) in a directory.
+    /// Load trust anchors from all certificate files (`*.pem`, `*.crt`, `*.cer`)
+    /// in a directory, **failing closed** on any load or parse error (B-5).
     ///
-    /// Non-PEM files and files that fail to parse are silently skipped.
+    /// A trust store silently dropping a malformed anchor file is dangerous: the
+    /// trust-anchor set shrinks without the operator noticing, so a chain that
+    /// *should* be trusted is rejected — or, worse, a partially-loaded set is
+    /// relied on as if complete. This method therefore returns an error as soon
+    /// as any candidate file cannot be read or parsed, naming the offending file,
+    /// rather than swallowing the failure.
+    ///
+    /// Files whose extension is not a recognised certificate extension are not
+    /// candidates and are skipped without error. Use
+    /// [`from_pem_directory_lenient`](Self::from_pem_directory_lenient) for the
+    /// previous best-effort behaviour (still surfaced via a returned count of
+    /// skipped files).
     pub fn from_pem_directory(dir: impl AsRef<Path>) -> Result<Self, TrustError> {
         let dir = dir.as_ref();
         if !dir.is_dir() {
@@ -283,15 +420,76 @@ impl TrustStore {
             if let Some(ext) = path.extension() {
                 let ext = ext.to_string_lossy().to_lowercase();
                 if ext == "pem" || ext == "crt" || ext == "cer" {
-                    if let Ok(data) = std::fs::read(&path) {
-                        // Best effort — skip files that aren't valid PEM
-                        let _ = store.add_pem_data(&data);
-                    }
+                    let data = std::fs::read(&path).map_err(|e| {
+                        TrustError::CertificateParse(format!(
+                            "failed to read trust anchor file {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    store.add_pem_data(&data).map_err(|e| {
+                        TrustError::CertificateParse(format!(
+                            "failed to parse trust anchor file {}: {e}",
+                            path.display()
+                        ))
+                    })?;
                 }
             }
         }
 
         Ok(store)
+    }
+
+    /// Best-effort variant of [`from_pem_directory`](Self::from_pem_directory):
+    /// files that fail to read or parse are skipped, but their count and the
+    /// per-file errors are **returned** (not silently dropped) so the caller can
+    /// log or assert on them.
+    ///
+    /// Returns `(store, skipped)` where `skipped` lists `(path, reason)` for each
+    /// candidate file that could not be loaded. A non-empty `skipped` means the
+    /// trust-anchor set is smaller than the directory's contents — the caller
+    /// MUST decide whether that is acceptable rather than have the decision made
+    /// silently for them.
+    pub fn from_pem_directory_lenient(
+        dir: impl AsRef<Path>,
+    ) -> Result<(Self, Vec<(std::path::PathBuf, String)>), TrustError> {
+        let dir = dir.as_ref();
+        if !dir.is_dir() {
+            return Err(TrustError::NotADirectory(dir.display().to_string()));
+        }
+
+        let mut store = Self::new();
+        let mut skipped: Vec<(std::path::PathBuf, String)> = Vec::new();
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .map_err(TrustError::Io)?
+            .filter_map(|e| e.ok())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                let ext = ext.to_string_lossy().to_lowercase();
+                if ext == "pem" || ext == "crt" || ext == "cer" {
+                    match std::fs::read(&path) {
+                        Ok(data) => {
+                            if let Err(e) = store.add_pem_data(&data) {
+                                log::warn!(
+                                    "skipping unparseable trust anchor {}: {e}",
+                                    path.display()
+                                );
+                                skipped.push((path.clone(), e.to_string()));
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("skipping unreadable trust anchor {}: {e}", path.display());
+                            skipped.push((path.clone(), e.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((store, skipped))
     }
 
     /// Add a single trust anchor from DER-encoded bytes.
@@ -442,10 +640,68 @@ impl TrustStore {
         chain: &[Certificate],
         validation_time: Option<der::DateTime>,
     ) -> Result<&Certificate, TrustError> {
+        self.verify_chain_inner(chain, validation_time, None)
+    }
+
+    /// Verify a certificate chain and additionally bind the **leaf**
+    /// (`chain[0]`, the end-entity) to an expected purpose.
+    ///
+    /// This is [`verify_chain`](Self::verify_chain) plus a leaf
+    /// extension-profile check: the leaf's `keyUsage`/`extendedKeyUsage` (etc.)
+    /// must match the supplied [`CertRole`] via
+    /// [`validate_extensions_for_role`](crate::ltv::validate_extensions_for_role).
+    /// Plain `verify_chain` validates only the *intermediates'* CA profile and
+    /// the trust anchor; without this, a certificate that legitimately chains to
+    /// an anchor but is **not authorised for the purpose at hand** (e.g. a TLS
+    /// server certificate presented as an OCSP-signing or timestamping
+    /// certificate) would be accepted — a purpose-confusion fail-open.
+    ///
+    /// Callers that know the role the leaf must satisfy (timestamping, OCSP
+    /// signing, TLS/end-entity, ...) should use this instead of
+    /// [`verify_chain`](Self::verify_chain).
+    #[cfg(feature = "ltv")]
+    pub fn verify_chain_for_purpose(
+        &self,
+        chain: &[Certificate],
+        validation_time: Option<der::DateTime>,
+        purpose: crate::ltv::CertRole,
+    ) -> Result<&Certificate, TrustError> {
+        self.verify_chain_inner(chain, validation_time, Some(purpose))
+    }
+
+    /// Core chain verification. `leaf_purpose`, when `Some`, binds the leaf
+    /// (`chain[0]`) to a [`CertRole`](crate::ltv::CertRole) extension profile.
+    fn verify_chain_inner(
+        &self,
+        chain: &[Certificate],
+        validation_time: Option<der::DateTime>,
+        #[cfg(feature = "ltv")] leaf_purpose: Option<crate::ltv::CertRole>,
+        #[cfg(not(feature = "ltv"))] leaf_purpose: Option<()>,
+    ) -> Result<&Certificate, TrustError> {
         let policy = &self.signature_policy;
         if chain.is_empty() {
             return Err(TrustError::EmptyChain);
         }
+
+        // RFC 5280 §4.2: reject any certificate (leaf, intermediate, or anchor)
+        // that asserts an unrecognized *critical* extension — fail closed.
+        for (i, cert) in chain.iter().enumerate() {
+            reject_unknown_critical_extensions(cert, &format!("certificate at index {i}"))?;
+        }
+
+        // Bind the leaf (chain[0]) to its expected purpose, when supplied. This
+        // closes the purpose-confusion fail-open: a cert that chains to an anchor
+        // but is not authorised for the role at hand must be rejected.
+        #[cfg(feature = "ltv")]
+        if let Some(role) = leaf_purpose {
+            crate::ltv::validate_extensions_for_role(&chain[0], role).map_err(|e| {
+                TrustError::SignatureVerification(format!(
+                    "leaf certificate does not satisfy required purpose {role}: {e}"
+                ))
+            })?;
+        }
+        #[cfg(not(feature = "ltv"))]
+        let _ = leaf_purpose;
 
         // Check time validity of all certificates in the chain
         if let Some(time) = validation_time {
@@ -529,6 +785,13 @@ impl TrustStore {
                 crate::crypto::verify::verify_certificate_signature_with_policy(
                     last, last, policy,
                 )?;
+                // The anchor is already the last element of `chain`; the full
+                // path is `chain` itself.
+                #[cfg(feature = "ltv")]
+                {
+                    let path: Vec<&Certificate> = chain.iter().collect();
+                    enforce_name_constraints_path(&path)?;
+                }
                 return Ok(&anchor.cert);
             }
         }
@@ -548,6 +811,11 @@ impl TrustStore {
                 last, anchor, policy,
             ) {
                 Ok(()) => {
+                    // The anchor is not part of `chain`, so its own critical
+                    // extensions were not checked in the per-chain loop above —
+                    // check them here (RFC 5280 §4.2 MUST-reject, fail closed).
+                    reject_unknown_critical_extensions(anchor, "trust anchor")?;
+
                     // Enforce the anchor's own pathLenConstraint. The chain
                     // builder stops before appending the anchor, so this anchor
                     // is not in `chain` and its constraint would otherwise never
@@ -570,6 +838,15 @@ impl TrustStore {
                                 not_after: validity.not_after.to_date_time(),
                             });
                         }
+                    }
+
+                    // Enforce name constraints over the full path with the anchor
+                    // appended (it is not in `chain`).
+                    #[cfg(feature = "ltv")]
+                    {
+                        let mut path: Vec<&Certificate> = chain.iter().collect();
+                        path.push(anchor);
+                        enforce_name_constraints_path(&path)?;
                     }
                     return Ok(anchor);
                 }
@@ -1036,5 +1313,411 @@ mod tests {
             matches!(err, TrustError::SignatureVerification(ref m) if m.contains("not a CA")),
             "expected non-CA intermediate rejection, got: {err:?}"
         );
+    }
+
+    // ── B4/M3, B3/M4, M2 helpers and tests ────────────────────────
+
+    /// Re-build a self-signed root certificate, replacing its extension list
+    /// with `extra_extensions` (each `(oid, critical, der_value)`) merged into
+    /// whatever the builder already emitted, then re-sign the TBS with `key`
+    /// under SHA-256 so the self-signature stays valid.
+    fn root_with_extensions(
+        common_name: &str,
+        key: &rsa::RsaPrivateKey,
+        extra_extensions: Vec<x509_cert::ext::Extension>,
+    ) -> Certificate {
+        use der::asn1::BitString;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{SignatureEncoding, Signer};
+        use sha2::Sha256;
+        use x509_cert::builder::Profile;
+
+        let signer = SigningKey::<Sha256>::new(key.clone());
+        let base = issue_cert(Profile::Root, common_name, key, &signer);
+
+        let mut tbs = base.tbs_certificate.clone();
+        let mut exts = tbs.extensions.clone().unwrap_or_default();
+        exts.extend(extra_extensions);
+        tbs.extensions = Some(exts);
+
+        let tbs_der = tbs.to_der().unwrap();
+        let sig = signer.sign(&tbs_der);
+        Certificate {
+            tbs_certificate: tbs,
+            signature_algorithm: base.signature_algorithm.clone(),
+            signature: BitString::from_bytes(&sig.to_bytes()).unwrap(),
+        }
+    }
+
+    fn ext(oid: &str, critical: bool, value: &[u8]) -> x509_cert::ext::Extension {
+        use der::asn1::OctetString;
+        x509_cert::ext::Extension {
+            extn_id: const_oid::ObjectIdentifier::new_unwrap(oid),
+            critical,
+            extn_value: OctetString::new(value.to_vec()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_verify_chain_rejects_unknown_critical_extension() {
+        // B4/M3: a self-signed anchor that asserts a *critical* extension we do
+        // not recognise must be rejected (RFC 5280 §4.2 MUST-reject).
+        let mut rng = rand::thread_rng();
+        let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        // OID 1.2.3.4.5 is not an extension we process. Mark it critical.
+        let root = root_with_extensions(
+            "CN=Critical Ext Root,O=tsp-ltv tests",
+            &key,
+            vec![ext("1.2.3.4.5", true, &[0x05, 0x00])],
+        );
+
+        let mut store = TrustStore::new();
+        store.add_certificate(root.clone()).unwrap();
+        let chain = [root];
+
+        let err = store
+            .verify_chain(&chain, None)
+            .expect_err("unknown critical extension must be rejected");
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("unrecognized critical extension")),
+            "expected unrecognized-critical-extension rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_chain_allows_unknown_noncritical_extension() {
+        // The same unknown extension marked *non-critical* must NOT cause
+        // rejection (guards against over-rejection).
+        let mut rng = rand::thread_rng();
+        let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let root = root_with_extensions(
+            "CN=NonCritical Ext Root,O=tsp-ltv tests",
+            &key,
+            vec![ext("1.2.3.4.5", false, &[0x05, 0x00])],
+        );
+
+        let mut store = TrustStore::new();
+        store.add_certificate(root.clone()).unwrap();
+        let chain = [root];
+        store
+            .verify_chain(&chain, None)
+            .expect("a non-critical unknown extension must be accepted");
+    }
+
+    /// Build `[leaf, root]` where the root is a CA anchor and `leaf` is signed by
+    /// it. `leaf_profile` controls the leaf's extensions (EKU/keyUsage).
+    #[cfg(feature = "ltv")]
+    fn leaf_and_root(leaf_profile: x509_cert::builder::Profile) -> (TrustStore, Vec<Certificate>) {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::RsaPrivateKey;
+        use sha2::Sha256;
+        use x509_cert::builder::Profile;
+
+        let mut rng = rand::thread_rng();
+        let root_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let root_signer = SigningKey::<Sha256>::new(root_key.clone());
+
+        let root = issue_cert(
+            Profile::Root,
+            "CN=Purpose Root,O=tsp-ltv tests",
+            &root_key,
+            &root_signer,
+        );
+        let leaf = issue_cert(
+            leaf_profile,
+            "CN=Purpose Leaf,O=tsp-ltv tests",
+            &leaf_key,
+            &root_signer,
+        );
+
+        let mut store = TrustStore::new();
+        store.add_certificate(root.clone()).unwrap();
+        (store, vec![leaf, root])
+    }
+
+    #[cfg(feature = "ltv")]
+    #[test]
+    fn test_verify_chain_for_purpose_rejects_wrong_eku() {
+        use crate::ltv::CertRole;
+        use x509_cert::builder::Profile;
+        use x509_cert::name::Name;
+
+        let root_issuer: Name = "CN=Purpose Root,O=tsp-ltv tests".parse().unwrap();
+        // A plain TLS-style end-entity leaf (digitalSignature, no OCSPSigning EKU).
+        let (store, chain) = leaf_and_root(Profile::Leaf {
+            issuer: root_issuer,
+            enable_key_agreement: false,
+            enable_key_encipherment: false,
+        });
+
+        // Plain verify_chain (no purpose) accepts it — it is a valid end-entity.
+        store
+            .verify_chain(&chain, None)
+            .expect("end-entity leaf should chain to anchor");
+
+        // But binding it to the OcspResponder purpose must fail: it lacks the
+        // id-kp-OCSPSigning EKU.
+        let err = store
+            .verify_chain_for_purpose(&chain, None, CertRole::OcspResponder)
+            .expect_err("leaf without OCSPSigning EKU must fail OcspResponder purpose");
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("required purpose")),
+            "expected purpose-binding rejection, got: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "ltv")]
+    #[test]
+    fn test_verify_chain_for_purpose_accepts_end_entity() {
+        use crate::ltv::CertRole;
+        use x509_cert::builder::Profile;
+        use x509_cert::name::Name;
+
+        let root_issuer: Name = "CN=Purpose Root,O=tsp-ltv tests".parse().unwrap();
+        let (store, chain) = leaf_and_root(Profile::Leaf {
+            issuer: root_issuer,
+            enable_key_agreement: false,
+            enable_key_encipherment: false,
+        });
+        // The leaf satisfies EndEntity (CA:FALSE + digitalSignature).
+        store
+            .verify_chain_for_purpose(&chain, None, CertRole::EndEntity)
+            .expect("end-entity leaf must satisfy EndEntity purpose");
+    }
+
+    // ── M2 name constraints ───────────────────────────────────────
+
+    /// Encode a NameConstraints extension value with a single dNSName subtree
+    /// under either permittedSubtrees [0] or excludedSubtrees [1].
+    #[cfg(feature = "ltv")]
+    fn name_constraints_dns(dns: &str, excluded: bool) -> Vec<u8> {
+        use crate::der_utils::{encode_sequence_raw, encode_tlv};
+        // GeneralName dNSName [2] IA5String (primitive, tag 0x82).
+        let gn = encode_tlv(0x82, dns.as_bytes());
+        // GeneralSubtree ::= SEQUENCE { base GeneralName }
+        let subtree = encode_sequence_raw(&gn);
+        // GeneralSubtrees ::= SEQUENCE OF GeneralSubtree (raw concatenation; one here)
+        // permittedSubtrees [0] / excludedSubtrees [1] (constructed context tag).
+        let tag = if excluded { 0xA1 } else { 0xA0 };
+        let subtrees = encode_tlv(tag, &subtree);
+        // NameConstraints ::= SEQUENCE { ... }
+        encode_sequence_raw(&subtrees)
+    }
+
+    /// Build `[leaf, root]` where `root` is a CA anchor carrying a critical
+    /// nameConstraints extension and `leaf` asserts `leaf_dns` via subjectAltName.
+    #[cfg(feature = "ltv")]
+    fn constrained_chain(
+        constraint_dns: &str,
+        excluded: bool,
+        leaf_dns: &str,
+    ) -> (TrustStore, Vec<Certificate>) {
+        use crate::der_utils::{encode_sequence_raw, encode_tlv};
+        use der::asn1::BitString;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{SignatureEncoding, Signer};
+        use rsa::RsaPrivateKey;
+        use sha2::Sha256;
+        use x509_cert::builder::Profile;
+
+        let mut rng = rand::thread_rng();
+        let root_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let root_signer = SigningKey::<Sha256>::new(root_key.clone());
+
+        // Root with a critical nameConstraints extension.
+        let nc_value = name_constraints_dns(constraint_dns, excluded);
+        let root = root_with_extensions(
+            "CN=NC Root,O=tsp-ltv tests",
+            &root_key,
+            vec![ext("2.5.29.30", true, &nc_value)],
+        );
+
+        // Leaf with a subjectAltName dNSName = leaf_dns, signed by the root.
+        let root_issuer: x509_cert::name::Name = root.tbs_certificate.subject.clone();
+        let leaf_base = issue_cert(
+            Profile::Leaf {
+                issuer: root_issuer,
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            "CN=NC Leaf,O=tsp-ltv tests",
+            &leaf_key,
+            &root_signer,
+        );
+        // subjectAltName ::= GeneralNames ::= SEQUENCE OF GeneralName.
+        let san_gn = encode_tlv(0x82, leaf_dns.as_bytes());
+        let san_value = encode_sequence_raw(&san_gn);
+
+        let mut tbs = leaf_base.tbs_certificate.clone();
+        let mut exts = tbs.extensions.clone().unwrap_or_default();
+        exts.push(ext("2.5.29.17", false, &san_value));
+        tbs.extensions = Some(exts);
+        let tbs_der = tbs.to_der().unwrap();
+        let sig = root_signer.sign(&tbs_der);
+        let leaf = Certificate {
+            tbs_certificate: tbs,
+            signature_algorithm: leaf_base.signature_algorithm.clone(),
+            signature: BitString::from_bytes(&sig.to_bytes()).unwrap(),
+        };
+
+        let mut store = TrustStore::new();
+        store.add_certificate(root.clone()).unwrap();
+        (store, vec![leaf, root])
+    }
+
+    #[cfg(feature = "ltv")]
+    #[test]
+    fn test_name_constraints_permitted_violation_rejected() {
+        // Anchor permits only *.example.com; a leaf SAN of host.evil.com is
+        // outside every permitted subtree → rejected.
+        let (store, chain) = constrained_chain("example.com", false, "host.evil.com");
+        let err = store
+            .verify_chain(&chain, None)
+            .expect_err("SAN outside permitted subtree must be rejected");
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("name constraint")),
+            "expected name-constraint violation, got: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "ltv")]
+    #[test]
+    fn test_name_constraints_permitted_within_accepted() {
+        // The same constraint with a leaf SAN inside the permitted subtree
+        // verifies (guards against over-rejection).
+        let (store, chain) = constrained_chain("example.com", false, "host.example.com");
+        store
+            .verify_chain(&chain, None)
+            .expect("SAN inside permitted subtree must be accepted");
+    }
+
+    #[cfg(feature = "ltv")]
+    #[test]
+    fn test_name_constraints_excluded_violation_rejected() {
+        // Anchor excludes bad.example.com; a leaf SAN inside it → rejected.
+        let (store, chain) = constrained_chain("bad.example.com", true, "host.bad.example.com");
+        let err = store
+            .verify_chain(&chain, None)
+            .expect_err("SAN within excluded subtree must be rejected");
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("name constraint")),
+            "expected excluded-subtree violation, got: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "ltv")]
+    #[test]
+    fn test_name_constraints_unsupported_type_fails_closed() {
+        // A critical nameConstraints (on the anchor CA, which has a subordinate
+        // leaf below it) constraining an unsupported GeneralName type ([6] URI,
+        // tag 0x86) must be rejected as unsupported (fail closed) when the chain
+        // is walked.
+        use crate::der_utils::{encode_sequence_raw, encode_tlv};
+        use der::asn1::BitString;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{SignatureEncoding, Signer};
+        use rsa::RsaPrivateKey;
+        use sha2::Sha256;
+        use x509_cert::builder::Profile;
+
+        let mut rng = rand::thread_rng();
+        let root_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let root_signer = SigningKey::<Sha256>::new(root_key.clone());
+
+        // permittedSubtrees [0] with a single [6] uniformResourceIdentifier base.
+        let gn = encode_tlv(0x86, b"http://example.com/");
+        let subtree = encode_sequence_raw(&gn);
+        let subtrees = encode_tlv(0xA0, &subtree);
+        let nc_value = encode_sequence_raw(&subtrees);
+
+        let root = root_with_extensions(
+            "CN=NC Unsupported Root,O=tsp-ltv tests",
+            &root_key,
+            vec![ext("2.5.29.30", true, &nc_value)],
+        );
+
+        // A leaf below the anchor so the anchor's constraints are actually
+        // evaluated during the walk.
+        let root_issuer: x509_cert::name::Name = root.tbs_certificate.subject.clone();
+        let leaf_base = issue_cert(
+            Profile::Leaf {
+                issuer: root_issuer,
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            "CN=NC Unsupported Leaf,O=tsp-ltv tests",
+            &leaf_key,
+            &root_signer,
+        );
+        let tbs = leaf_base.tbs_certificate.clone();
+        let tbs_der = tbs.to_der().unwrap();
+        let sig = root_signer.sign(&tbs_der);
+        let leaf = Certificate {
+            tbs_certificate: tbs,
+            signature_algorithm: leaf_base.signature_algorithm.clone(),
+            signature: BitString::from_bytes(&sig.to_bytes()).unwrap(),
+        };
+
+        let mut store = TrustStore::new();
+        store.add_certificate(root.clone()).unwrap();
+        let chain = [leaf, root];
+
+        let err = store
+            .verify_chain(&chain, None)
+            .expect_err("unsupported name-constraint type must fail closed");
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("unsupported name constraint")),
+            "expected unsupported-name-constraint rejection, got: {err:?}"
+        );
+    }
+
+    // ── B5: trust-store directory load failures are surfaced ──────
+
+    #[test]
+    fn test_from_pem_directory_fails_closed_on_malformed_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        // One valid anchor.
+        let ca_pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ca_cert.pem"
+        ));
+        std::fs::write(dir.path().join("good.pem"), ca_pem).unwrap();
+        // One malformed anchor file with a recognised extension.
+        std::fs::write(
+            dir.path().join("bad.pem"),
+            "-----BEGIN CERTIFICATE-----\nnot base64!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+
+        // B5: the malformed file must NOT be silently skipped — it surfaces as
+        // an error rather than shrinking the trust set.
+        let err = TrustStore::from_pem_directory(dir.path())
+            .expect_err("a malformed anchor file must surface as an error");
+        assert!(
+            matches!(err, TrustError::CertificateParse(ref m) if m.contains("bad.pem")),
+            "error should name the offending file, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_from_pem_directory_lenient_reports_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ca_cert.pem"
+        ));
+        std::fs::write(dir.path().join("good.pem"), ca_pem).unwrap();
+        std::fs::write(dir.path().join("bad.crt"), "garbage, not a PEM at all").unwrap();
+
+        let (store, skipped) =
+            TrustStore::from_pem_directory_lenient(dir.path()).expect("lenient load");
+        // The good anchor loaded.
+        assert_eq!(store.len(), 1, "the valid anchor must still load");
+        // The bad one is reported (not silently dropped).
+        assert_eq!(skipped.len(), 1, "the malformed file must be reported");
+        assert!(skipped[0].0.ends_with("bad.crt"));
     }
 }

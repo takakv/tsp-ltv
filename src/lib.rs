@@ -22,6 +22,9 @@ pub mod trust;
 
 // Feature-gated modules
 #[cfg(feature = "tsp")]
+pub mod net;
+
+#[cfg(feature = "tsp")]
 pub mod tsp;
 
 #[cfg(feature = "ltv")]
