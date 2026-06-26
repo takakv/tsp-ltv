@@ -438,10 +438,13 @@ async fn run_ocsp_check(
 
         // RFC 6960 §4.2.2.2.1: a delegated responder lacking
         // id-pkix-ocsp-nocheck must itself be revocation-checked. If its own
-        // status is Revoked, the OCSP response cannot be trusted — fail closed
-        // (Invalid). An Unknown/unreachable responder-revocation result does not
-        // invalidate an otherwise-good response on its own (the response's own
-        // freshness/signature already passed); it is left to the overall
+        // status is Revoked — or definitively Invalid (e.g. an exhausted
+        // recursion budget on a nested delegation, or an integrity failure on
+        // the responder's own revocation data) — the OCSP response cannot be
+        // trusted, so we fail closed (Invalid). Only an Unknown/unreachable
+        // responder-revocation result is tolerated: it does not invalidate an
+        // otherwise-good response on its own (the response's own
+        // freshness/signature already passed) and is left to the overall
         // policy. Recursion is bounded by `max_ocsp_recursion` so a responder
         // that itself uses a delegated responder cannot loop unboundedly.
         if let Some(responder) = &outcome.delegated_responder {
@@ -467,10 +470,11 @@ async fn run_ocsp_check(
                     validation_time,
                 ))
                 .await;
-            if responder_status.is_revoked() {
+            if responder_status.is_revoked() || responder_status.is_invalid() {
                 return ValidationStatus::Invalid {
                     reason: format!(
-                        "delegated OCSP responder certificate is revoked: {responder_status}"
+                        "delegated OCSP responder certificate could not be confirmed \
+                         unrevoked: {responder_status}"
                     ),
                 };
             }

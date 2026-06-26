@@ -409,10 +409,13 @@ impl TrustStore {
         }
 
         let mut store = Self::new();
+        // Fail closed on directory-entry I/O errors too: a transient FS fault or
+        // a permission problem while enumerating must not silently shrink the
+        // trust-anchor set.
         let mut entries: Vec<_> = std::fs::read_dir(dir)
             .map_err(TrustError::Io)?
-            .filter_map(|e| e.ok())
-            .collect();
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(TrustError::Io)?;
         entries.sort_by_key(|e| e.file_name());
 
         for entry in entries {
@@ -459,10 +462,22 @@ impl TrustStore {
 
         let mut store = Self::new();
         let mut skipped: Vec<(std::path::PathBuf, String)> = Vec::new();
-        let mut entries: Vec<_> = std::fs::read_dir(dir)
-            .map_err(TrustError::Io)?
-            .filter_map(|e| e.ok())
-            .collect();
+        let mut entries: Vec<std::fs::DirEntry> = Vec::new();
+        for entry in std::fs::read_dir(dir).map_err(TrustError::Io)? {
+            match entry {
+                Ok(entry) => entries.push(entry),
+                // Even in lenient mode, a dropped directory entry is reported
+                // rather than silently swallowed, so the caller can see that the
+                // enumeration was incomplete.
+                Err(e) => {
+                    log::warn!(
+                        "skipping unreadable directory entry in {}: {e}",
+                        dir.display()
+                    );
+                    skipped.push((dir.to_path_buf(), format!("directory entry error: {e}")));
+                }
+            }
+        }
         entries.sort_by_key(|e| e.file_name());
 
         for entry in entries {
