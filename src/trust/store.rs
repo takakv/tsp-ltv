@@ -177,38 +177,54 @@ fn enforce_path_len(
 }
 
 /// Object identifiers (dotted strings) of the X.509v3 extensions this crate
-/// recognises and processes during chain verification. Per RFC 5280 §4.2 an
-/// unrecognised **critical** extension MUST cause the certificate (and thus the
-/// chain) to be rejected — see [`reject_unknown_critical_extensions`]. An
-/// extension is listed here only if the crate actually understands it:
+/// recognises and processes during chain verification, regardless of which
+/// features are compiled in. Per RFC 5280 §4.2 an unrecognised **critical**
+/// extension MUST cause the certificate (and thus the chain) to be rejected —
+/// see [`reject_unknown_critical_extensions`]. An extension is listed here only
+/// if the crate actually understands it in *every* build configuration:
 ///
 /// - `2.5.29.19` basicConstraints — processed by `basic_constraints` /
 ///   `enforce_path_len`.
 /// - `2.5.29.15` keyUsage — processed by `key_cert_sign` /
 ///   `validate_extensions_for_role`.
-/// - `2.5.29.37` extendedKeyUsage — processed by leaf-purpose binding
-///   (`validate_extensions_for_role`).
-/// - `2.5.29.17` subjectAltName — consumed by name-constraints checking.
-/// - `2.5.29.30` nameConstraints — processed under the `ltv` feature; a
-///   tsp-only build does not process it, so it is intentionally **absent** from
-///   the always-on list and present only in the `ltv` extension below, keeping a
-///   critical nameConstraints fail-closed when name-constraint enforcement is
-///   not compiled in.
-/// - `2.5.29.31` cRLDistributionPoints — consumed by the CRL fetch path.
-/// - `1.3.6.1.5.5.7.1.1` authorityInfoAccess — consumed by the AIA/OCSP path.
+/// - `2.5.29.37` extendedKeyUsage — processed in every build: a tsp-only build
+///   requires a critical `id-kp-timeStamping` EKU on the TSA signer
+///   (`tsp::token::require_timestamping_eku`, RFC 3161 §2.3), and the `ltv`
+///   build additionally binds the leaf via `verify_chain_for_purpose`.
+///
+/// Extensions whose *only* processing path lives behind the `ltv` feature
+/// (`subjectAltName`, `cRLDistributionPoints`, `authorityInfoAccess`,
+/// `nameConstraints`) are NOT listed here. A tsp-only build does not process
+/// them, so a certificate asserting any of them **critical** is rejected (fail
+/// closed); they are recognised only via [`RECOGNIZED_CRITICAL_EXT_OIDS_LTV`]
+/// when the code that processes them is compiled in.
 ///
 /// `subjectKeyIdentifier` (`2.5.29.14`) and `authorityKeyIdentifier`
-/// (`2.5.29.35`) are not security-load-bearing here, but RFC 5280 mandates they
-/// be **non-critical**, so they never reach the critical check; they are omitted
-/// deliberately (a certificate that marks them critical is malformed and is
-/// rejected — fail closed).
+/// (`2.5.29.35`) are deliberately omitted from every list. RFC 5280 requires
+/// them to be **non-critical**; a certificate that nonetheless marks one
+/// critical therefore hits the critical check as an unrecognised OID and is
+/// rejected (fail closed).
 const RECOGNIZED_CRITICAL_EXT_OIDS: &[&str] = &[
-    "2.5.29.19",         // basicConstraints
-    "2.5.29.15",         // keyUsage
-    "2.5.29.37",         // extendedKeyUsage
-    "2.5.29.17",         // subjectAltName
-    "2.5.29.31",         // cRLDistributionPoints
-    "1.3.6.1.5.5.7.1.1", // authorityInfoAccess
+    "2.5.29.19", // basicConstraints
+    "2.5.29.15", // keyUsage
+    "2.5.29.37", // extendedKeyUsage
+];
+
+/// Critical extensions recognised **only** when the `ltv` feature compiles in
+/// the code that processes them. In a tsp-only build none of these have a
+/// processing path, so a certificate asserting them critical is rejected by
+/// [`reject_unknown_critical_extensions`] (RFC 5280 §4.2 — fail closed).
+///
+/// - `2.5.29.17` subjectAltName — consumed by name-constraints checking.
+/// - `2.5.29.31` cRLDistributionPoints — consumed by the CRL fetch path.
+/// - `1.3.6.1.5.5.7.1.1` authorityInfoAccess — consumed by the AIA/OCSP path.
+/// - `2.5.29.30` nameConstraints — enforced by `enforce_name_constraints_path`.
+#[cfg(feature = "ltv")]
+const RECOGNIZED_CRITICAL_EXT_OIDS_LTV: &[&str] = &[
+    "2.5.29.17",                                        // subjectAltName
+    "2.5.29.31",                                        // cRLDistributionPoints
+    "1.3.6.1.5.5.7.1.1",                                // authorityInfoAccess
+    crate::ltv::name_constraints::NAME_CONSTRAINTS_OID, // 2.5.29.30 nameConstraints
 ];
 
 /// Reject a certificate that asserts a **critical** extension this crate does
@@ -231,15 +247,16 @@ fn reject_unknown_critical_extensions(cert: &Certificate, label: &str) -> Result
             continue;
         }
         let oid = ext.extn_id.to_string();
-        // `mut` is used only under `ltv` (the nameConstraints branch below);
-        // tsp-only builds never reassign it.
+        // `mut` is used only under `ltv` (the extra-OID branch below); tsp-only
+        // builds never reassign it.
         #[allow(unused_mut)]
         let mut recognized = RECOGNIZED_CRITICAL_EXT_OIDS.contains(&oid.as_str());
-        // nameConstraints (2.5.29.30) is only *processed* under the `ltv`
-        // feature; recognise it as critical only when we can enforce it.
+        // subjectAltName / cRLDistributionPoints / authorityInfoAccess /
+        // nameConstraints are only *processed* under the `ltv` feature;
+        // recognise them as critical only when that code is compiled in.
         #[cfg(feature = "ltv")]
         {
-            if oid == crate::ltv::name_constraints::NAME_CONSTRAINTS_OID {
+            if !recognized && RECOGNIZED_CRITICAL_EXT_OIDS_LTV.contains(&oid.as_str()) {
                 recognized = true;
             }
         }
@@ -1417,6 +1434,49 @@ mod tests {
         store
             .verify_chain(&chain, None)
             .expect("a non-critical unknown extension must be accepted");
+    }
+
+    #[test]
+    #[cfg(not(feature = "ltv"))]
+    fn test_tsp_only_rejects_critical_ltv_only_extension() {
+        // In a tsp-only build the crate has no processing path for
+        // subjectAltName / cRLDistributionPoints / authorityInfoAccess, so a
+        // certificate asserting any of them *critical* must be rejected
+        // (RFC 5280 §4.2 — fail closed). A critical extendedKeyUsage, by
+        // contrast, IS processed (tsp requires id-kp-timeStamping) and must
+        // still be accepted.
+        let mut rng = rand::thread_rng();
+        let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+
+        // 2.5.29.17 subjectAltName, marked critical -> rejected without ltv.
+        let san_root = root_with_extensions(
+            "CN=Critical SAN Root,O=tsp-ltv tests",
+            &key,
+            // Minimal GeneralNames SEQUENCE; value is irrelevant to the
+            // critical-OID check.
+            vec![ext("2.5.29.17", true, &[0x30, 0x00])],
+        );
+        let mut store = TrustStore::new();
+        store.add_certificate(san_root.clone()).unwrap();
+        let err = store
+            .verify_chain(&[san_root], None)
+            .expect_err("critical subjectAltName must be rejected in a tsp-only build");
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("unrecognized critical extension")),
+            "expected unrecognized-critical-extension rejection, got: {err:?}"
+        );
+
+        // 2.5.29.37 extendedKeyUsage, marked critical -> still accepted.
+        let eku_root = root_with_extensions(
+            "CN=Critical EKU Root,O=tsp-ltv tests",
+            &key,
+            vec![ext("2.5.29.37", true, &[0x30, 0x00])],
+        );
+        let mut store = TrustStore::new();
+        store.add_certificate(eku_root.clone()).unwrap();
+        store
+            .verify_chain(&[eku_root], None)
+            .expect("a critical extendedKeyUsage is processed and must be accepted");
     }
 
     /// Build `[leaf, root]` where the root is a CA anchor and `leaf` is signed by
