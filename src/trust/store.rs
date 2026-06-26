@@ -400,8 +400,8 @@ impl TrustStore {
     /// Files whose extension is not a recognised certificate extension are not
     /// candidates and are skipped without error. Use
     /// [`from_pem_directory_lenient`](Self::from_pem_directory_lenient) for the
-    /// previous best-effort behaviour (still surfaced via a returned count of
-    /// skipped files).
+    /// previous best-effort behaviour (still surfaced via a returned list of
+    /// skipped files and reasons).
     pub fn from_pem_directory(dir: impl AsRef<Path>) -> Result<Self, TrustError> {
         let dir = dir.as_ref();
         if !dir.is_dir() {
@@ -440,9 +440,9 @@ impl TrustStore {
     }
 
     /// Best-effort variant of [`from_pem_directory`](Self::from_pem_directory):
-    /// files that fail to read or parse are skipped, but their count and the
-    /// per-file errors are **returned** (not silently dropped) so the caller can
-    /// log or assert on them.
+    /// files that fail to read or parse are skipped, but the skipped file paths
+    /// and per-file errors are **returned** (not silently dropped) so the caller
+    /// can log or assert on them.
     ///
     /// Returns `(store, skipped)` where `skipped` lists `(path, reason)` for each
     /// candidate file that could not be loaded. A non-empty `skipped` means the

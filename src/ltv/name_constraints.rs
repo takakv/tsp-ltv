@@ -349,10 +349,14 @@ fn collect_san_names(
             )),
             GN_IP => {
                 // In a SAN, iPAddress is the bare address (4 or 16 bytes).
-                if gn_body.len() == 4 || gn_body.len() == 16 {
-                    names.push(AssertedName::Ip(gn_body.to_vec()));
+                match gn_body.len() {
+                    4 | 16 => names.push(AssertedName::Ip(gn_body.to_vec())),
+                    n => {
+                        return Err(NameConstraintError::Parse(format!(
+                            "SAN iPAddress must be 4 or 16 bytes, got {n}"
+                        )));
+                    }
                 }
-                // A malformed length is simply not matchable; skip it.
             }
             GN_DIRECTORY => {
                 // [4] EXPLICIT Name.
@@ -543,5 +547,17 @@ mod tests {
         // GeneralName [6] uniformResourceIdentifier (0x86) is not supported.
         let err = decode_base_general_name(0x86, b"http://x/").unwrap_err();
         assert!(matches!(err, NameConstraintError::Unsupported(_)));
+    }
+
+    #[test]
+    fn malformed_ip_san_fails_closed() {
+        use crate::der_utils::{encode_sequence_raw, encode_tlv};
+
+        let san_value = encode_sequence_raw(&encode_tlv(GN_IP, &[192, 0, 2]));
+        let mut names = Vec::new();
+        let err = collect_san_names(&san_value, &mut names).unwrap_err();
+
+        assert!(matches!(err, NameConstraintError::Parse(ref m) if m.contains("iPAddress")));
+        assert!(names.is_empty());
     }
 }
