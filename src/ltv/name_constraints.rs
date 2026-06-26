@@ -245,14 +245,59 @@ fn parse_general_subtrees(body: &[u8]) -> Result<Vec<GeneralNameBase>, NameConst
                 "expected GeneralSubtree SEQUENCE, got 0x{t:02x}"
             )));
         }
-        // The base GeneralName is the first element; minimum/maximum follow but
-        // RFC 5280 §4.2.1.10 says they MUST be absent/0 — we ignore them.
-        let (gn_tag, gn_body, _gn_rest) = parse_tlv_with_rest(st_body)
+        // The base GeneralName is the first element; the optional
+        // `minimum [0]`/`maximum [1]` BaseDistance fields follow. RFC 5280
+        // §4.2.1.10 mandates `minimum` be 0 and `maximum` be absent within this
+        // profile, so we validate (fail closed) rather than silently ignore
+        // them: a constraint carrying a non-zero minimum or any maximum encodes
+        // semantics we do not implement.
+        let (gn_tag, gn_body, gn_rest) = parse_tlv_with_rest(st_body)
             .map_err(|e| NameConstraintError::Parse(format!("base GeneralName: {e}")))?;
+        validate_subtree_min_max(gn_rest)?;
         out.push(decode_base_general_name(gn_tag, gn_body)?);
         pos = rest;
     }
     Ok(out)
+}
+
+/// Validate the bytes following the base `GeneralName` inside a `GeneralSubtree`.
+///
+/// RFC 5280 §4.2.1.10: "the minimum and maximum fields are not used with any
+/// name forms, thus, the minimum MUST be zero, and maximum MUST be absent." In
+/// canonical DER `minimum` (DEFAULT 0) is omitted and `maximum` is absent, so a
+/// well-formed subtree has nothing here. We accept only an explicitly encoded
+/// `minimum [0] = 0` and reject everything else (non-zero minimum, any maximum,
+/// or unexpected trailing content) — fail closed.
+fn validate_subtree_min_max(mut rest: &[u8]) -> Result<(), NameConstraintError> {
+    while !rest.is_empty() {
+        let (tag, body, next) = parse_tlv_with_rest(rest)
+            .map_err(|e| NameConstraintError::Parse(format!("GeneralSubtree min/max: {e}")))?;
+        match tag {
+            // minimum [0] IMPLICIT BaseDistance (INTEGER). Accept only 0.
+            0x80 => {
+                if body.len() != 1 || body[0] != 0 {
+                    return Err(NameConstraintError::Violation(
+                        "NameConstraints GeneralSubtree.minimum must be 0 (RFC 5280 §4.2.1.10)"
+                            .into(),
+                    ));
+                }
+            }
+            // maximum [1] MUST be absent.
+            0x81 => {
+                return Err(NameConstraintError::Violation(
+                    "NameConstraints GeneralSubtree.maximum must be absent (RFC 5280 §4.2.1.10)"
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(NameConstraintError::Parse(format!(
+                    "unexpected field [tag 0x{other:02x}] in GeneralSubtree"
+                )));
+            }
+        }
+        rest = next;
+    }
+    Ok(())
 }
 
 /// Decode a base GeneralName from a constraint, failing closed on unsupported
@@ -588,5 +633,37 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, NameConstraintError::Parse(ref m) if m.contains("directoryName")));
+    }
+
+    #[test]
+    fn general_subtree_min_max_fail_closed() {
+        use crate::der_utils::{encode_sequence_raw, encode_tlv};
+
+        let base = encode_tlv(GN_DNS, b"example.com");
+
+        // Bare base (no minimum/maximum) -> accepted.
+        let ok = encode_sequence_raw(&base);
+        assert!(parse_general_subtrees(&ok).is_ok());
+
+        // Explicitly encoded minimum [0] = 0 -> accepted (RFC 5280 requires 0).
+        let mut st = base.clone();
+        st.extend(encode_tlv(0x80, &[0x00]));
+        assert!(parse_general_subtrees(&encode_sequence_raw(&st)).is_ok());
+
+        // Non-zero minimum -> rejected (fail closed).
+        let mut st = base.clone();
+        st.extend(encode_tlv(0x80, &[0x05]));
+        assert!(matches!(
+            parse_general_subtrees(&encode_sequence_raw(&st)).unwrap_err(),
+            NameConstraintError::Violation(ref m) if m.contains("minimum")
+        ));
+
+        // maximum [1] present -> rejected (RFC 5280 requires it absent).
+        let mut st = base.clone();
+        st.extend(encode_tlv(0x81, &[0x05]));
+        assert!(matches!(
+            parse_general_subtrees(&encode_sequence_raw(&st)).unwrap_err(),
+            NameConstraintError::Violation(ref m) if m.contains("maximum")
+        ));
     }
 }
