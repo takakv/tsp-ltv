@@ -446,9 +446,9 @@ impl TrustStore {
                 let ext = ext.to_string_lossy().to_lowercase();
                 if ext == "pem" || ext == "crt" || ext == "cer" {
                     let data = std::fs::read(&path).map_err(|e| {
-                        TrustError::CertificateParse(format!(
-                            "failed to read trust anchor file {}: {e}",
-                            path.display()
+                        TrustError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("failed to read trust anchor file {}: {e}", path.display()),
                         ))
                     })?;
                     store.add_anchor_file_data(&data).map_err(|e| {
@@ -1848,6 +1848,23 @@ mod tests {
         assert!(
             matches!(err, TrustError::CertificateParse(ref m) if m.contains("bad.pem")),
             "error should name the offending file, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_from_pem_directory_read_failure_is_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory with a certificate extension is a candidate path, but it
+        // cannot be read as an anchor file. This exercises the strict loader's
+        // file-read failure path without relying on platform-specific chmod
+        // behavior.
+        std::fs::create_dir(dir.path().join("unreadable.pem")).unwrap();
+
+        let err = TrustStore::from_pem_directory(dir.path())
+            .expect_err("a trust-anchor read failure must surface as I/O");
+        assert!(
+            matches!(err, TrustError::Io(ref e) if e.to_string().contains("unreadable.pem")),
+            "expected TrustError::Io naming the offending path, got: {err:?}"
         );
     }
 

@@ -200,7 +200,7 @@ pub async fn validate_fetch_url(url: &str) -> Result<(), UrlGuardError> {
     for addr in &addrs {
         if is_disallowed_ip(addr.ip()) {
             return Err(UrlGuardError::NonPublic(format!(
-                "{host_owned} resolves to non-public address {}",
+                "{host_owned} resolved to {}",
                 addr.ip()
             )));
         }
@@ -252,5 +252,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, UrlGuardError::NonPublic(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_localhost_without_duplicate_non_public_message() {
+        let err = validate_fetch_url("http://localhost/x").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, UrlGuardError::NonPublic(_)));
+        assert_eq!(
+            msg.matches("non-public address").count(),
+            1,
+            "non-public wording should not be duplicated: {msg}"
+        );
     }
 }
