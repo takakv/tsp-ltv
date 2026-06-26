@@ -135,7 +135,7 @@ impl CrlClient {
     async fn validate_url(url: &str) -> Result<(), LtvError> {
         crate::net::validate_fetch_url(url)
             .await
-            .map_err(|e| LtvError::Crl(format!("CRL {e}")))
+            .map_err(|e| LtvError::Crl(format!("URL rejected: {e}")))
     }
 
     /// Extract CRL distribution point URLs from a certificate.

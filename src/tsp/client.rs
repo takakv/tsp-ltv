@@ -138,7 +138,7 @@ impl TsaClient {
     pub async fn timestamp(&self, data_hash: &[u8]) -> Result<Vec<u8>, TspError> {
         crate::net::validate_fetch_url(&self.url)
             .await
-            .map_err(|e| TspError::HttpError(format!("TSA {e}")))?;
+            .map_err(|e| TspError::HttpError(format!("URL rejected: {e}")))?;
 
         // Generate nonce for replay protection
         let nonce = token::generate_nonce();

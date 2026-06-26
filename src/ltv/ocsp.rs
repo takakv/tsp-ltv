@@ -248,7 +248,7 @@ impl OcspClient {
     async fn send_ocsp_request(&self, url: &str, request_der: &[u8]) -> Result<Vec<u8>, LtvError> {
         crate::net::validate_fetch_url(url)
             .await
-            .map_err(|e| LtvError::Ocsp(format!("OCSP {e}")))?;
+            .map_err(|e| LtvError::Ocsp(format!("URL rejected: {e}")))?;
 
         log::debug!(
             "Sending OCSP request to {url} ({} bytes)",

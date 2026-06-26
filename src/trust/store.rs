@@ -536,7 +536,17 @@ impl TrustStore {
     /// fail-close on perfectly valid anchors. PEM is recognised by its
     /// `-----BEGIN` armor; any other content is parsed as DER.
     fn add_anchor_file_data(&mut self, data: &[u8]) -> Result<(), TrustError> {
-        if data.windows(PEM_ARMOR.len()).any(|w| w == PEM_ARMOR) {
+        // Recognise PEM by its armor at the *start* of the file (after optional
+        // leading ASCII whitespace), not by a substring scan: a DER certificate
+        // can legitimately contain the bytes "-----BEGIN" inside an ASN.1
+        // string, and a substring match would misclassify it as PEM and then
+        // fail to parse a perfectly valid anchor. (Manual whitespace skip rather
+        // than `trim_ascii_start`, which would raise the crate MSRV to 1.80.)
+        let start = data
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(data.len());
+        if data[start..].starts_with(PEM_ARMOR) {
             self.add_pem_data(data)
         } else {
             self.add_der_certificate(data)
@@ -1913,5 +1923,33 @@ mod tests {
             TrustStore::from_pem_directory_lenient(dir.path()).expect("lenient load");
         assert_eq!(store.len(), 1);
         assert!(skipped.is_empty(), "a valid DER anchor must not be skipped");
+    }
+
+    #[test]
+    fn test_anchor_file_pem_detection_is_anchored() {
+        // A DER blob that merely *contains* the PEM armor later in the bytes
+        // must be classified as DER, not PEM: the armor check is anchored to the
+        // start (after optional whitespace), not a substring search.
+        let mut store = TrustStore::new();
+        let mut der_like = vec![0x30u8, 0x03, 0x02, 0x01, 0x00];
+        der_like.extend_from_slice(b"-----BEGIN CERTIFICATE-----");
+        let err = store
+            .add_anchor_file_data(&der_like)
+            .expect_err("armor not at the start must take the DER path");
+        assert!(
+            matches!(err, TrustError::CertificateParse(ref m) if m.contains("DER")),
+            "embedded armor must not trigger PEM parsing, got: {err:?}"
+        );
+
+        // Leading whitespace before genuine PEM armor is still recognised.
+        let ca_pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ca_cert.pem"
+        ));
+        let padded = format!("\n  \t{ca_pem}");
+        store
+            .add_anchor_file_data(padded.as_bytes())
+            .expect("leading-whitespace PEM must be recognised and loaded");
+        assert_eq!(store.len(), 1);
     }
 }

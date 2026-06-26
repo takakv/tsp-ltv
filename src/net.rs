@@ -38,9 +38,13 @@ use reqwest::Client;
 /// Maximum HTTP redirects followed by a [`hardened_http_client`].
 pub const MAX_REDIRECTS: usize = 5;
 
-/// Classify an IPv4 address as non-public (loopback, private, link-local,
-/// unspecified, broadcast, documentation, multicast, or RFC 6598 CGNAT shared
-/// space).
+/// Classify an IPv4 address as non-public so the SSRF guard can refuse it.
+///
+/// This is the stable-Rust equivalent of "not [`Ipv4Addr::is_global`]" (which
+/// is still nightly-only): rather than enumerate an allow-list, we deny every
+/// block that is not globally routable. A hand-maintained subset would silently
+/// miss reserved ranges as they are defined, so the deny-list mirrors the std
+/// `is_global` definition and adds multicast (never a valid fetch target).
 fn is_disallowed_ipv4(v4: Ipv4Addr) -> bool {
     let o = v4.octets();
     v4.is_loopback()
@@ -50,8 +54,16 @@ fn is_disallowed_ipv4(v4: Ipv4Addr) -> bool {
         || v4.is_broadcast()
         || v4.is_documentation()
         || v4.is_multicast()
+        // "This network" 0.0.0.0/8 (RFC 1122)
+        || o[0] == 0
         // CGNAT shared address space 100.64.0.0/10 (RFC 6598)
         || (o[0] == 100 && (o[1] & 0xc0) == 0x40)
+        // IETF protocol assignments 192.0.0.0/24 (RFC 6890)
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        // Benchmarking 198.18.0.0/15 (RFC 2544)
+        || (o[0] == 198 && (o[1] & 0xfe) == 18)
+        // Reserved for future use 240.0.0.0/4 (RFC 1112), incl. broadcast
+        || o[0] >= 240
 }
 
 /// Classify an IP address as non-public, so an SSRF guard can refuse fetches
@@ -232,6 +244,20 @@ mod tests {
         assert!(!is_disallowed_ip("8.8.8.8".parse().unwrap()));
         assert!(!is_disallowed_ip("1.1.1.1".parse().unwrap()));
         assert!(!is_disallowed_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn reserved_ipv4_ranges_are_disallowed() {
+        // Blocks that a hand-maintained allow-list previously missed but that
+        // are not globally routable (mirrors Ipv4Addr::is_global).
+        assert!(is_disallowed_ip("0.1.2.3".parse().unwrap())); // 0.0.0.0/8 "this network"
+        assert!(is_disallowed_ip("192.0.0.1".parse().unwrap())); // 192.0.0.0/24 IETF
+        assert!(is_disallowed_ip("198.18.0.1".parse().unwrap())); // 198.18.0.0/15 benchmarking
+        assert!(is_disallowed_ip("198.19.255.255".parse().unwrap())); // 198.18.0.0/15 upper half
+        assert!(is_disallowed_ip("240.0.0.1".parse().unwrap())); // 240.0.0.0/4 reserved
+        assert!(is_disallowed_ip("255.255.255.255".parse().unwrap())); // broadcast
+                                                                       // Documentation block stays blocked.
+        assert!(is_disallowed_ip("203.0.113.7".parse().unwrap()));
     }
 
     #[tokio::test]
