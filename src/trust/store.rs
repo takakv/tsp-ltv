@@ -210,6 +210,9 @@ const RECOGNIZED_CRITICAL_EXT_OIDS: &[&str] = &[
     "2.5.29.37", // extendedKeyUsage
 ];
 
+/// PEM armor marker used to distinguish a PEM anchor file from raw DER.
+const PEM_ARMOR: &[u8] = b"-----BEGIN";
+
 /// Critical extensions recognised **only** when the `ltv` feature compiles in
 /// the code that processes them. In a tsp-only build none of these have a
 /// processing path, so a certificate asserting them critical is rejected by
@@ -405,7 +408,9 @@ impl TrustStore {
     }
 
     /// Load trust anchors from all certificate files (`*.pem`, `*.crt`, `*.cer`)
-    /// in a directory, **failing closed** on any load or parse error (B-5).
+    /// in a directory, **failing closed** on any load or parse error (B-5). Each
+    /// file may be PEM (one or more certificates) or a single DER-encoded
+    /// certificate — `.crt`/`.cer` anchors are commonly raw DER.
     ///
     /// A trust store silently dropping a malformed anchor file is dangerous: the
     /// trust-anchor set shrinks without the operator noticing, so a chain that
@@ -446,7 +451,7 @@ impl TrustStore {
                             path.display()
                         ))
                     })?;
-                    store.add_pem_data(&data).map_err(|e| {
+                    store.add_anchor_file_data(&data).map_err(|e| {
                         TrustError::CertificateParse(format!(
                             "failed to parse trust anchor file {}: {e}",
                             path.display()
@@ -504,7 +509,7 @@ impl TrustStore {
                 if ext == "pem" || ext == "crt" || ext == "cer" {
                     match std::fs::read(&path) {
                         Ok(data) => {
-                            if let Err(e) = store.add_pem_data(&data) {
+                            if let Err(e) = store.add_anchor_file_data(&data) {
                                 log::warn!(
                                     "skipping unparseable trust anchor {}: {e}",
                                     path.display()
@@ -522,6 +527,20 @@ impl TrustStore {
         }
 
         Ok((store, skipped))
+    }
+
+    /// Load one anchor file's bytes, accepting either PEM (possibly a
+    /// multi-certificate bundle) or a single DER-encoded certificate.
+    ///
+    /// `.crt`/`.cer` files are frequently raw DER, so a PEM-only parse would
+    /// fail-close on perfectly valid anchors. PEM is recognised by its
+    /// `-----BEGIN` armor; any other content is parsed as DER.
+    fn add_anchor_file_data(&mut self, data: &[u8]) -> Result<(), TrustError> {
+        if data.windows(PEM_ARMOR.len()).any(|w| w == PEM_ARMOR) {
+            self.add_pem_data(data)
+        } else {
+            self.add_der_certificate(data)
+        }
     }
 
     /// Add a single trust anchor from DER-encoded bytes.
@@ -847,6 +866,7 @@ impl TrustStore {
                     // extensions were not checked in the per-chain loop above —
                     // check them here (RFC 5280 §4.2 MUST-reject, fail closed).
                     reject_unknown_critical_extensions(anchor, "trust anchor")?;
+                    validate_intermediate_ca_extensions(anchor, "trust anchor")?;
 
                     // Enforce the anchor's own pathLenConstraint. The chain
                     // builder stops before appending the anchor, so this anchor
@@ -1347,6 +1367,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_verify_chain_rejects_non_ca_trust_anchor_out_of_chain() {
+        // A trust anchor found from the store must meet the same CA profile as
+        // an in-chain issuer/root. Leaving the root out of `chain` exercises the
+        // find_all_issuers path.
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::RsaPrivateKey;
+        use sha2::Sha256;
+        use x509_cert::builder::Profile;
+        use x509_cert::name::Name;
+
+        let mut rng = rand::thread_rng();
+        let root_key = RsaPrivateKey::new(&mut rng, 2048).expect("root key");
+        let leaf_key = RsaPrivateKey::new(&mut rng, 2048).expect("leaf key");
+        let root_signer = SigningKey::<Sha256>::new(root_key.clone());
+
+        let root_name = "CN=NonCA Anchor,O=tsp-ltv tests";
+        let leaf_name = "CN=NonCA Anchor Leaf,O=tsp-ltv tests";
+        let root_issuer: Name = root_name.parse().unwrap();
+
+        let root = issue_cert(
+            Profile::Leaf {
+                issuer: root_issuer.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            root_name,
+            &root_key,
+            &root_signer,
+        );
+        let leaf = issue_cert(
+            Profile::Leaf {
+                issuer: root_issuer,
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            leaf_name,
+            &leaf_key,
+            &root_signer,
+        );
+
+        let mut store = TrustStore::new();
+        store.add_certificate(root).unwrap();
+        let chain = vec![leaf];
+
+        let err = store
+            .verify_chain(&chain, None)
+            .expect_err("a non-CA trust anchor must be rejected");
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("trust anchor") && m.contains("not a CA")),
+            "expected non-CA trust-anchor rejection, got: {err:?}"
+        );
+    }
+
     // ── B4/M3, B3/M4, M2 helpers and tests ────────────────────────
 
     /// Re-build a self-signed root certificate, replacing its extension list
@@ -1794,5 +1868,33 @@ mod tests {
         // The bad one is reported (not silently dropped).
         assert_eq!(skipped.len(), 1, "the malformed file must be reported");
         assert!(skipped[0].0.ends_with("bad.crt"));
+    }
+
+    #[test]
+    fn test_from_pem_directory_accepts_der_crt() {
+        // A `.crt`/`.cer` anchor is commonly raw DER rather than PEM. It must
+        // load rather than fail-close with an "invalid UTF-8 in PEM" error.
+        let ca_pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ca_cert.pem"
+        ));
+        // Recover the DER of the fixture certificate.
+        let mut tmp = TrustStore::new();
+        tmp.add_pem_data(ca_pem.as_bytes()).unwrap();
+        let der = tmp.anchors[0].der.clone();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("anchor.crt"), &der).unwrap();
+
+        // Strict loader accepts the DER anchor.
+        let store = TrustStore::from_pem_directory(dir.path())
+            .expect("a DER-encoded .crt anchor must load");
+        assert_eq!(store.len(), 1);
+
+        // Lenient loader too, with nothing skipped.
+        let (store, skipped) =
+            TrustStore::from_pem_directory_lenient(dir.path()).expect("lenient load");
+        assert_eq!(store.len(), 1);
+        assert!(skipped.is_empty(), "a valid DER anchor must not be skipped");
     }
 }

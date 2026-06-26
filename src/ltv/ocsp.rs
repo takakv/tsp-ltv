@@ -154,7 +154,7 @@ impl OcspClient {
     /// Create a new OCSP client with default settings.
     pub fn new() -> Self {
         Self {
-            http_client: Client::new(),
+            http_client: crate::net::hardened_http_client(),
             timeout: Duration::from_secs(30),
         }
     }
@@ -246,6 +246,10 @@ impl OcspClient {
 
     /// Send an OCSP request to the given URL.
     async fn send_ocsp_request(&self, url: &str, request_der: &[u8]) -> Result<Vec<u8>, LtvError> {
+        crate::net::validate_fetch_url(url)
+            .await
+            .map_err(|e| LtvError::Ocsp(format!("OCSP {e}")))?;
+
         log::debug!(
             "Sending OCSP request to {url} ({} bytes)",
             request_der.len()
@@ -1708,6 +1712,20 @@ mod tests {
     fn test_ocsp_client_default() {
         let client = OcspClient::new();
         assert_eq!(client.timeout, Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn test_send_ocsp_request_rejects_loopback_url() {
+        let client = OcspClient::new();
+        let err = client
+            .send_ocsp_request("http://127.0.0.1/ocsp", &[0x30, 0x00])
+            .await
+            .expect_err("loopback OCSP responder URL must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-public") || msg.contains("SSRF"),
+            "expected SSRF rejection, got: {msg}"
+        );
     }
 
     #[test]

@@ -70,7 +70,7 @@ impl TsaClient {
     pub fn new(url: &str) -> Self {
         Self {
             url: url.to_string(),
-            http_client: Client::new(),
+            http_client: crate::net::hardened_http_client(),
             digest_algorithm: DigestAlgorithm::Sha256,
             policy_oid: None,
             timeout: Duration::from_secs(30),
@@ -136,6 +136,10 @@ impl TsaClient {
     /// Returns the raw DER-encoded TimeStampToken (a CMS ContentInfo
     /// wrapping SignedData with TSTInfo as the encapsulated content).
     pub async fn timestamp(&self, data_hash: &[u8]) -> Result<Vec<u8>, TspError> {
+        crate::net::validate_fetch_url(&self.url)
+            .await
+            .map_err(|e| TspError::HttpError(format!("TSA {e}")))?;
+
         // Generate nonce for replay protection
         let nonce = token::generate_nonce();
 
@@ -314,5 +318,33 @@ impl TsaClientPool {
     /// Check if the pool is empty (should never be true after construction).
     pub fn is_empty(&self) -> bool {
         self.clients.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tsa_client_default() {
+        let client = TsaClient::new("http://timestamp.example.com");
+        assert_eq!(client.url(), "http://timestamp.example.com");
+        assert_eq!(client.timeout, Duration::from_secs(30));
+        assert!(client.cert_req);
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_rejects_loopback_url() {
+        let client = TsaClient::new("http://127.0.0.1/tsa");
+        let data_hash = DigestAlgorithm::Sha256.digest(b"hello");
+        let err = client
+            .timestamp(&data_hash)
+            .await
+            .expect_err("loopback TSA URL must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-public") || msg.contains("SSRF"),
+            "expected SSRF rejection, got: {msg}"
+        );
     }
 }
