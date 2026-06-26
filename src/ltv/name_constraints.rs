@@ -15,7 +15,8 @@
 //!
 //! - **dNSName** (`[2]`) — case-insensitive suffix match, RFC 5280 label-boundary
 //!   semantics (a constraint of `example.com` matches `host.example.com` and
-//!   `example.com`, but not `notexample.com`).
+//!   `example.com`, but not `notexample.com`; `.example.com` matches
+//!   subdomains only).
 //! - **rfc822Name** (`[1]`) — host-part / domain / sub-domain matching.
 //! - **iPAddress** (`[7]`) — CIDR (`address/netmask`) containment for IPv4 and
 //!   IPv6.
@@ -389,7 +390,7 @@ fn base_matches(base: &GeneralNameBase, name: &AssertedName) -> Result<bool, Nam
         (GeneralNameBase::Dns(b), AssertedName::Dns(n)) => Ok(dns_matches(b, n)),
         (GeneralNameBase::Rfc822(b), AssertedName::Rfc822(n)) => Ok(rfc822_matches(b, n)),
         (GeneralNameBase::Ip(addr, mask), AssertedName::Ip(n)) => Ok(ip_matches(addr, mask, n)),
-        (GeneralNameBase::Directory(b), AssertedName::Directory(n)) => Ok(directory_matches(b, n)),
+        (GeneralNameBase::Directory(b), AssertedName::Directory(n)) => directory_matches(b, n),
         _ => Ok(false),
     }
 }
@@ -401,7 +402,11 @@ fn dns_matches(base: &str, name: &str) -> bool {
     if base.is_empty() {
         return true;
     }
-    let base = base.trim_start_matches('.');
+    if let Some(suffix) = base.strip_prefix('.') {
+        return name.len() > suffix.len()
+            && name.ends_with(suffix)
+            && name.as_bytes()[name.len() - suffix.len() - 1] == b'.';
+    }
     if name == base {
         return true;
     }
@@ -456,51 +461,59 @@ fn ip_matches(addr: &[u8], mask: &[u8], name: &[u8]) -> bool {
 /// sequence is a prefix of the asserted name's RDN sequence (RFC 5280
 /// §4.2.1.10). Both inputs are the DER of the `[4]`-EXPLICIT wrapper or the bare
 /// Name; we normalise to the inner Name SEQUENCE then compare RDN-by-RDN.
-fn directory_matches(base_wrapped: &[u8], name_wrapped: &[u8]) -> bool {
-    let Some(base_rdns) = inner_name_rdns(base_wrapped) else {
-        return false;
-    };
-    let Some(name_rdns) = inner_name_rdns(name_wrapped) else {
-        return false;
-    };
+fn directory_matches(
+    base_wrapped: &[u8],
+    name_wrapped: &[u8],
+) -> Result<bool, NameConstraintError> {
+    let base_rdns = inner_name_rdns(base_wrapped)?;
+    let name_rdns = inner_name_rdns(name_wrapped)?;
     if base_rdns.len() > name_rdns.len() {
-        return false;
+        return Ok(false);
     }
     // Prefix match: each of the base's RDNs must equal the corresponding RDN of
     // the asserted name (DER byte-equality — the simple, conservative test).
-    base_rdns.iter().zip(name_rdns.iter()).all(|(b, n)| b == n)
+    Ok(base_rdns.iter().zip(name_rdns.iter()).all(|(b, n)| b == n))
 }
 
 /// Given the DER of a directoryName (either the bare `Name` SEQUENCE `30..` or
 /// the `[4]`-EXPLICIT wrapper `A4..`), return the list of raw DER-encoded RDNs
-/// (each `31..`), or `None` if malformed.
-fn inner_name_rdns(der: &[u8]) -> Option<Vec<Vec<u8>>> {
-    let (tag, body) = parse_tlv(der).ok()?;
+/// (each `31..`), or a parse error if malformed.
+fn inner_name_rdns(der: &[u8]) -> Result<Vec<Vec<u8>>, NameConstraintError> {
+    let (tag, body) =
+        parse_tlv(der).map_err(|e| NameConstraintError::Parse(format!("directoryName: {e}")))?;
     let name_body = if tag == GN_DIRECTORY {
         // EXPLICIT [4] wrapper: unwrap to the inner Name SEQUENCE.
-        let (inner_tag, inner_body) = parse_tlv(&body).ok()?;
+        let (inner_tag, inner_body) = parse_tlv(&body)
+            .map_err(|e| NameConstraintError::Parse(format!("directoryName inner Name: {e}")))?;
         if inner_tag != 0x30 {
-            return None;
+            return Err(NameConstraintError::Parse(format!(
+                "directoryName inner tag 0x{inner_tag:02x}, expected SEQUENCE"
+            )));
         }
         inner_body
     } else if tag == 0x30 {
         body
     } else {
-        return None;
+        return Err(NameConstraintError::Parse(format!(
+            "directoryName tag 0x{tag:02x}, expected [4] or SEQUENCE"
+        )));
     };
     // RDNSequence ::= SEQUENCE OF RelativeDistinguishedName (each a SET, 0x31).
     let mut rdns = Vec::new();
     let mut pos = &name_body[..];
     while !pos.is_empty() {
-        let (rdn_tag, _rdn_body, rest) = parse_tlv_with_rest(pos).ok()?;
+        let (rdn_tag, _rdn_body, rest) = parse_tlv_with_rest(pos)
+            .map_err(|e| NameConstraintError::Parse(format!("directoryName RDN: {e}")))?;
         let consumed = pos.len() - rest.len();
         if rdn_tag != 0x31 {
-            return None;
+            return Err(NameConstraintError::Parse(format!(
+                "directoryName RDN tag 0x{rdn_tag:02x}, expected SET"
+            )));
         }
         rdns.push(pos[..consumed].to_vec());
         pos = rest;
     }
-    Some(rdns)
+    Ok(rdns)
 }
 
 #[cfg(test)]
@@ -511,6 +524,8 @@ mod tests {
     fn dns_label_boundary() {
         assert!(dns_matches("example.com", "host.example.com"));
         assert!(dns_matches("example.com", "example.com"));
+        assert!(dns_matches(".example.com", "host.example.com"));
+        assert!(!dns_matches(".example.com", "example.com"));
         assert!(!dns_matches("example.com", "notexample.com"));
         assert!(!dns_matches("example.com", "example.com.evil.com"));
         assert!(dns_matches("", "anything.test")); // empty base = all
@@ -559,5 +574,19 @@ mod tests {
 
         assert!(matches!(err, NameConstraintError::Parse(ref m) if m.contains("iPAddress")));
         assert!(names.is_empty());
+    }
+
+    #[test]
+    fn malformed_directory_name_fails_closed() {
+        let valid_name = [0x30, 0x00];
+        let invalid_name = [0x04, 0x00];
+
+        let err = base_matches(
+            &GeneralNameBase::Directory(valid_name.to_vec()),
+            &AssertedName::Directory(invalid_name.to_vec()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, NameConstraintError::Parse(ref m) if m.contains("directoryName")));
     }
 }
