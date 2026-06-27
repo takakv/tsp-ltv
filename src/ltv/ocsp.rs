@@ -154,7 +154,7 @@ impl OcspClient {
     /// Create a new OCSP client with default settings.
     pub fn new() -> Self {
         Self {
-            http_client: Client::new(),
+            http_client: crate::net::hardened_http_client(),
             timeout: Duration::from_secs(30),
         }
     }
@@ -246,6 +246,18 @@ impl OcspClient {
 
     /// Send an OCSP request to the given URL.
     async fn send_ocsp_request(&self, url: &str, request_der: &[u8]) -> Result<Vec<u8>, LtvError> {
+        // Bound the SSRF guard's DNS resolution by the same timeout as the HTTP
+        // request, so a slow/blocked resolver cannot hang past `self.timeout`.
+        match tokio::time::timeout(self.timeout, crate::net::validate_fetch_url(url)).await {
+            Ok(result) => result.map_err(|e| LtvError::Ocsp(format!("URL rejected: {e}")))?,
+            Err(_) => {
+                return Err(LtvError::Ocsp(format!(
+                    "URL validation timed out after {:?}",
+                    self.timeout
+                )))
+            }
+        }
+
         log::debug!(
             "Sending OCSP request to {url} ({} bytes)",
             request_der.len()
@@ -1101,23 +1113,47 @@ fn verify_ocsp_response_signature(
 
 // ── Responder trust validation ─────────────────────────────────────
 
-/// Validate that the OCSP responder is trusted.
+/// Outcome of [`validate_responder_trust`]: whether the (now-trusted) OCSP
+/// responder still needs its **own** revocation status checked.
+///
+/// Per RFC 6960 §4.2.2.2.1, a *delegated* responder certificate (one issued by
+/// the CA with `id-kp-OCSPSigning`) that does **not** carry the
+/// `id-pkix-ocsp-nocheck` extension must itself be revocation-checked — the CA
+/// is asserting it may be revoked. A responder that **is** the issuing CA, or a
+/// delegated responder that carries `nocheck`, needs no such check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponderRevocationCheck {
+    /// No further check needed (responder is the issuing CA, or a delegated
+    /// responder bearing `id-pkix-ocsp-nocheck`).
+    NotRequired,
+    /// The responder is a delegated signer lacking `nocheck`; its own revocation
+    /// status (against the CA `issuer`) must be checked by the caller.
+    Required,
+}
+
+/// Validate that the OCSP responder is trusted, matching it to the response's
+/// `responderID`.
 ///
 /// Per RFC 6960 §4.2.2.2, the response signer must be one of:
 /// 1. The CA that issued the certificate being checked (issuer == responder)
 /// 2. A responder whose certificate is issued by the CA and has the
 ///    id-kp-OCSPSigning extended key usage
 ///
+/// The responder certificate is additionally bound to the response's
+/// `responderID` (byName: subject DN match; byKeyHash: SHA-1 of the responder's
+/// public key), so a valid-but-unrelated certificate cannot be substituted.
+///
 /// The responder certificate's own validity period is checked against `now`.
-/// Additionally, if the responder certificate has the id-pkix-ocsp-nocheck
-/// extension, the responder's own revocation status need not be checked
-/// (not implemented here — both cases just return Ok).
+/// The return value reports whether the responder's **own** revocation status
+/// must still be checked (a delegated responder without
+/// `id-pkix-ocsp-nocheck`) — see [`ResponderRevocationCheck`].
 fn validate_responder_trust(
     responder_cert: &Certificate,
     issuer: &Certificate,
+    parsed: &ParsedBasicOcspResponse,
     policy: &crate::crypto::verify::SignaturePolicy,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<(), LtvError> {
+) -> Result<ResponderRevocationCheck, LtvError> {
     // Check the responder certificate's own validity period (M-6).
     let validity = &responder_cert.tbs_certificate.validity;
     let not_before = validity.not_before.to_date_time();
@@ -1157,13 +1193,19 @@ fn validate_responder_trust(
         )));
     }
 
-    // Case 1: responder IS the issuer
+    // Bind the responder certificate to the response's responderID, so a
+    // valid-but-unrelated certificate (e.g. another cert signed by the same CA)
+    // cannot be substituted for the one the response names.
+    responder_matches_responder_id(responder_cert, &parsed.responder_id)?;
+
+    // Case 1: responder IS the issuer. The CA signs its own OCSP responses; no
+    // separate responder-revocation check applies.
     if certs_have_same_subject(responder_cert, issuer) {
-        return Ok(());
+        return Ok(ResponderRevocationCheck::NotRequired);
     }
 
-    // Case 2: responder is a delegated OCSP signer
-    // Must be issued by the same CA (issuer)
+    // Case 2: responder is a delegated OCSP signer.
+    // Must be issued by the same CA (issuer).
     let issuer_signed = crate::crypto::verify::verify_certificate_signature_with_policy(
         responder_cert,
         issuer,
@@ -1175,14 +1217,61 @@ fn validate_responder_trust(
         ));
     }
 
-    // Must have id-kp-OCSPSigning EKU
+    // Must have id-kp-OCSPSigning EKU.
     if !has_ocsp_signing_eku(responder_cert) {
         return Err(LtvError::Ocsp(
             "OCSP responder certificate lacks id-kp-OCSPSigning EKU".into(),
         ));
     }
 
-    Ok(())
+    // RFC 6960 §4.2.2.2.1: a delegated responder without id-pkix-ocsp-nocheck
+    // must itself be revocation-checked. With nocheck, the CA waives that.
+    if has_ocsp_nocheck_extension(responder_cert) {
+        Ok(ResponderRevocationCheck::NotRequired)
+    } else {
+        Ok(ResponderRevocationCheck::Required)
+    }
+}
+
+/// Bind the responder certificate to the response's `responderID`
+/// (RFC 6960 §4.2.1): byName matches the responder's subject DN; byKeyHash
+/// matches the SHA-1 of the responder's subjectPublicKey BIT STRING contents.
+fn responder_matches_responder_id(
+    responder_cert: &Certificate,
+    responder_id: &ResponderId,
+) -> Result<(), LtvError> {
+    match responder_id {
+        ResponderId::ByName(name_der) => {
+            let subject_der = responder_cert
+                .tbs_certificate
+                .subject
+                .to_der()
+                .map_err(|e| LtvError::Ocsp(format!("responder subject encode: {e}")))?;
+            if &subject_der != name_der {
+                return Err(LtvError::Ocsp(
+                    "OCSP responder certificate subject does not match responderID (byName)".into(),
+                ));
+            }
+            Ok(())
+        }
+        ResponderId::ByKeyHash(key_hash) => {
+            // Hash the SPKI public-key bit-string slice directly; no need to
+            // allocate a temporary Vec on every OCSP response verification.
+            let key_bytes = responder_cert
+                .tbs_certificate
+                .subject_public_key_info
+                .subject_public_key
+                .raw_bytes();
+            let computed = sha1_hash(key_bytes);
+            if &computed != key_hash {
+                return Err(LtvError::Ocsp(
+                    "OCSP responder certificate key hash does not match responderID (byKeyHash)"
+                        .into(),
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Check if two certificates have the same subject DN (by DER comparison).
@@ -1456,6 +1545,51 @@ pub fn check_revocation_with_options(
     policy: &crate::crypto::verify::SignaturePolicy,
     freshness: &OcspFreshness,
 ) -> Result<ValidationStatus, LtvError> {
+    check_revocation_detailed(
+        response_der,
+        cert,
+        issuer,
+        nonce,
+        validation_time,
+        policy,
+        freshness,
+    )
+    .map(|outcome| outcome.status)
+}
+
+/// The result of an OCSP revocation check, including any delegated responder
+/// certificate whose **own** revocation status the caller must still verify.
+#[derive(Debug, Clone)]
+pub struct OcspCheckOutcome {
+    /// The certificate-status result for the queried certificate.
+    pub status: ValidationStatus,
+    /// When `Some`, the OCSP response was signed by a *delegated* responder
+    /// (issued by the CA, `id-kp-OCSPSigning`) that does **not** carry
+    /// `id-pkix-ocsp-nocheck`. Per RFC 6960 §4.2.2.2.1 the caller must check this
+    /// responder certificate's own revocation status (against the CA `issuer`);
+    /// if it is revoked, the OCSP response must not be relied upon. When `None`,
+    /// no further responder check is required (the responder is the issuing CA,
+    /// or a delegated responder bearing `nocheck`).
+    pub delegated_responder: Option<Certificate>,
+}
+
+/// Like [`check_revocation_with_options`] but also reports whether the OCSP
+/// response was signed by a delegated responder whose own revocation status must
+/// still be checked (RFC 6960 §4.2.2.2.1 — `id-pkix-ocsp-nocheck` consultation).
+///
+/// Most callers should use [`check_revocation_with_options`]; the async
+/// orchestrator uses this variant so it can perform the responder-revocation
+/// check (which requires network access) itself.
+#[allow(clippy::too_many_arguments)]
+pub fn check_revocation_detailed(
+    response_der: &[u8],
+    cert: &Certificate,
+    issuer: &Certificate,
+    nonce: Option<&[u8]>,
+    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    policy: &crate::crypto::verify::SignaturePolicy,
+    freshness: &OcspFreshness,
+) -> Result<OcspCheckOutcome, LtvError> {
     let now = validation_time.unwrap_or_else(chrono::Utc::now);
 
     // 1. Parse OCSP response
@@ -1464,8 +1598,14 @@ pub fn check_revocation_with_options(
     // 2. Verify signature — returns the responder certificate
     let responder_cert = verify_ocsp_response_signature(&parsed, issuer, policy)?;
 
-    // 3. Validate responder trust (including cert validity vs. now)
-    validate_responder_trust(&responder_cert, issuer, policy, now)?;
+    // 3. Validate responder trust (responderID match, cert validity vs. now,
+    //    issuer/EKU for delegated responders) and learn whether the responder's
+    //    own revocation status must still be checked.
+    let responder_check = validate_responder_trust(&responder_cert, issuer, &parsed, policy, now)?;
+    let delegated_responder = match responder_check {
+        ResponderRevocationCheck::Required => Some(responder_cert.clone()),
+        ResponderRevocationCheck::NotRequired => None,
+    };
 
     // 4. Validate nonce (if provided)
     if let Some(request_nonce) = nonce {
@@ -1508,8 +1648,13 @@ pub fn check_revocation_with_options(
     let sr = match matching_response {
         Some(sr) => sr,
         None => {
-            return Ok(ValidationStatus::Unknown {
-                reason: "certificate not found in OCSP response".into(),
+            return Ok(OcspCheckOutcome {
+                status: ValidationStatus::Unknown {
+                    reason: "certificate not found in OCSP response".into(),
+                },
+                // The response was not about our certificate; no responder
+                // revocation check is warranted.
+                delegated_responder: None,
             });
         }
     };
@@ -1521,11 +1666,11 @@ pub fn check_revocation_with_options(
     validate_response_freshness(sr, now, freshness)?;
 
     // 7. Map CertStatus to ValidationStatus
-    match &sr.cert_status {
-        CertStatus::Good => Ok(ValidationStatus::Valid {
+    let status = match &sr.cert_status {
+        CertStatus::Good => ValidationStatus::Valid {
             source: RevocationSource::Ocsp,
             checked_at: now,
-        }),
+        },
         CertStatus::Revoked {
             revocation_time,
             reason,
@@ -1536,22 +1681,27 @@ pub fn check_revocation_with_options(
                     "cert found revoked in OCSP but revocation_time ({}) is after validation_time ({})",
                     revocation_time, now
                 );
-                Ok(ValidationStatus::Valid {
+                ValidationStatus::Valid {
                     source: RevocationSource::Ocsp,
                     checked_at: now,
-                })
+                }
             } else {
-                Ok(ValidationStatus::Revoked {
+                ValidationStatus::Revoked {
                     source: RevocationSource::Ocsp,
                     reason: *reason,
                     revocation_time: *revocation_time,
-                })
+                }
             }
         }
-        CertStatus::Unknown => Ok(ValidationStatus::Unknown {
+        CertStatus::Unknown => ValidationStatus::Unknown {
             reason: "OCSP responder reported certificate status as unknown".into(),
-        }),
-    }
+        },
+    };
+
+    Ok(OcspCheckOutcome {
+        status,
+        delegated_responder,
+    })
 }
 
 /// Compute SHA-1 hash of data.
@@ -1571,6 +1721,20 @@ mod tests {
     fn test_ocsp_client_default() {
         let client = OcspClient::new();
         assert_eq!(client.timeout, Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn test_send_ocsp_request_rejects_loopback_url() {
+        let client = OcspClient::new();
+        let err = client
+            .send_ocsp_request("http://127.0.0.1/ocsp", &[0x30, 0x00])
+            .await
+            .expect_err("loopback OCSP responder URL must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-public") || msg.contains("SSRF"),
+            "expected SSRF rejection, got: {msg}"
+        );
     }
 
     #[test]
@@ -1710,6 +1874,29 @@ mod tests {
         )
     }
 
+    /// Build a synthetic OCSP response with the given (already-encoded)
+    /// responderID TLV, signed with `issuer_key_pem`. Lets a test stamp a
+    /// responderID that intentionally does NOT match the signer.
+    fn build_test_ocsp_response_with_responder_id(
+        issuer_cert: &Certificate,
+        issuer_key_pem: &str,
+        cert: &Certificate,
+        status: &CertStatus,
+        responder_id_tlv: &[u8],
+    ) -> Vec<u8> {
+        build_test_ocsp_response_full(
+            issuer_cert,
+            issuer_key_pem,
+            cert,
+            status,
+            None,
+            "20260601120000Z",
+            "20260601120000Z",
+            Some("20260608120000Z"),
+            responder_id_tlv,
+        )
+    }
+
     /// Like [`build_test_ocsp_response`] but with explicit `producedAt`,
     /// `thisUpdate`, and optional `nextUpdate` GeneralizedTime strings.
     #[allow(clippy::too_many_arguments)]
@@ -1723,6 +1910,37 @@ mod tests {
         this_update_str: &str,
         next_update_str: Option<&str>,
     ) -> Vec<u8> {
+        // Default: responderID byName = the issuer's subject (the responder is
+        // the issuing CA).
+        let issuer_subject_der = issuer_cert.tbs_certificate.subject.to_der().unwrap();
+        let responder_id = der_utils::encode_tlv(0xA1, &issuer_subject_der);
+        build_test_ocsp_response_full(
+            issuer_cert,
+            issuer_key_pem,
+            cert,
+            status,
+            nonce,
+            produced_at_str,
+            this_update_str,
+            next_update_str,
+            &responder_id,
+        )
+    }
+
+    /// Core synthetic-OCSP-response builder taking every field explicitly,
+    /// including the already-encoded responderID TLV.
+    #[allow(clippy::too_many_arguments)]
+    fn build_test_ocsp_response_full(
+        issuer_cert: &Certificate,
+        issuer_key_pem: &str,
+        cert: &Certificate,
+        status: &CertStatus,
+        nonce: Option<&[u8]>,
+        produced_at_str: &str,
+        this_update_str: &str,
+        next_update_str: Option<&str>,
+        responder_id_tlv: &[u8],
+    ) -> Vec<u8> {
         use rsa::pkcs1v15::SigningKey;
         use rsa::pkcs8::DecodePrivateKey;
         use rsa::signature::{SignatureEncoding, Signer};
@@ -1731,10 +1949,8 @@ mod tests {
         // Build tbsResponseData body
         let mut tbs_body = Vec::new();
 
-        // responderID: byName [1] — use issuer's subject
-        let issuer_subject_der = issuer_cert.tbs_certificate.subject.to_der().unwrap();
-        let responder_id = der_utils::encode_tlv(0xA1, &issuer_subject_der);
-        tbs_body.extend_from_slice(&responder_id);
+        // responderID: caller-supplied [1] byName / [2] byKeyHash TLV.
+        tbs_body.extend_from_slice(responder_id_tlv);
 
         // producedAt GeneralizedTime
         let produced_at = der_utils::encode_tlv(0x18, produced_at_str.as_bytes());
@@ -2267,5 +2483,120 @@ mod tests {
         let parsed = parse_ocsp_response(&response_der).unwrap();
         // Our synthetic response uses byName
         assert!(matches!(parsed.responder_id, ResponderId::ByName(_)));
+    }
+
+    // ── B2/M7: responder_id matching + nocheck consultation ───────────
+
+    #[test]
+    fn test_responder_matches_responder_id_byname() {
+        let issuer = intermediate_ca_cert();
+        let issuer_subject = issuer.tbs_certificate.subject.to_der().unwrap();
+
+        // Correct byName matches the issuer (the responder) subject.
+        assert!(responder_matches_responder_id(
+            &issuer,
+            &ResponderId::ByName(issuer_subject.clone())
+        )
+        .is_ok());
+
+        // A different DN (the signer's subject) must NOT match.
+        let other = signer_cert().tbs_certificate.subject.to_der().unwrap();
+        let err = responder_matches_responder_id(&issuer, &ResponderId::ByName(other))
+            .expect_err("mismatched responderID byName must be rejected");
+        assert!(
+            matches!(err, LtvError::Ocsp(ref m) if m.contains("byName")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn test_responder_matches_responder_id_bykeyhash() {
+        let issuer = intermediate_ca_cert();
+        let key_bytes = issuer
+            .tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .raw_bytes()
+            .to_vec();
+        let correct = sha1_hash(&key_bytes);
+        assert!(responder_matches_responder_id(&issuer, &ResponderId::ByKeyHash(correct)).is_ok());
+
+        let wrong = sha1_hash(b"not the responder key");
+        let err = responder_matches_responder_id(&issuer, &ResponderId::ByKeyHash(wrong))
+            .expect_err("mismatched responderID byKeyHash must be rejected");
+        assert!(
+            matches!(err, LtvError::Ocsp(ref m) if m.contains("byKeyHash")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn test_check_revocation_rejects_wrong_responder_id() {
+        // B2/M7: a response whose responderID (byName) names a *different*
+        // certificate than the one whose key actually signed it must be
+        // rejected — the responder cannot be substituted.
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        // Sign with the issuer key but stamp the responderID byName as the
+        // *signer's* DN (which is not the responder/issuer).
+        let wrong_name = cert.tbs_certificate.subject.to_der().unwrap();
+        let response_der = build_test_ocsp_response_with_responder_id(
+            &issuer,
+            &key_pem,
+            &cert,
+            &CertStatus::Good,
+            &der_utils::encode_tlv(0xA1, &wrong_name),
+        );
+
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let err = check_revocation(&response_der, &cert, &issuer, None, Some(validation_time))
+            .expect_err("a response with a mismatched responderID must be rejected");
+        assert!(
+            matches!(err, LtvError::Ocsp(ref m) if m.contains("responderID")),
+            "expected responderID mismatch rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_issuer_responder_needs_no_revocation_check() {
+        // When the responder IS the issuing CA (not delegated), no responder
+        // revocation check is required and the detailed outcome carries no
+        // delegated responder.
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+        let response_der =
+            build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, None);
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let outcome = check_revocation_detailed(
+            &response_der,
+            &cert,
+            &issuer,
+            None,
+            Some(validation_time),
+            &crate::crypto::verify::SignaturePolicy::default(),
+            &OcspFreshness::default(),
+        )
+        .unwrap();
+        assert!(outcome.status.is_valid());
+        assert!(
+            outcome.delegated_responder.is_none(),
+            "a CA-signed (non-delegated) response needs no responder revocation check"
+        );
     }
 }

@@ -21,6 +21,7 @@
 
 pub mod chain;
 pub mod crl;
+pub mod name_constraints;
 pub mod ocsp;
 pub mod revocation;
 pub mod status;
@@ -30,9 +31,10 @@ pub mod x509_ext;
 pub use chain::ChainBuilder;
 pub use crl::CrlClient;
 pub use ocsp::{
-    build_ocsp_request_with_nonce, check_revocation as ocsp_check_revocation, extract_aia_urls,
-    has_ocsp_nocheck_extension, parse_ocsp_response, AiaAccessMethod, CertStatus, OcspClient,
-    OcspFreshness, ParsedBasicOcspResponse, ResponderId, SingleResponse,
+    build_ocsp_request_with_nonce, check_revocation as ocsp_check_revocation,
+    check_revocation_detailed as ocsp_check_revocation_detailed, extract_aia_urls,
+    has_ocsp_nocheck_extension, parse_ocsp_response, AiaAccessMethod, CertStatus, OcspCheckOutcome,
+    OcspClient, OcspFreshness, ParsedBasicOcspResponse, ResponderId, SingleResponse,
 };
 #[cfg(feature = "blocking")]
 pub use revocation::check_certificate_revocation_blocking;

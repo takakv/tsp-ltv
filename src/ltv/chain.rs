@@ -16,26 +16,53 @@ use crate::trust::TrustStore;
 /// Maximum chain depth to prevent infinite loops.
 const MAX_CHAIN_DEPTH: usize = 10;
 
+/// Maximum allowed AIA `caIssuers` response body size (1 MiB).
+///
+/// A DER/PEM certificate (or even a `certs-only` PKCS#7 bundle) is small; 1 MiB
+/// is far above any legitimate response while bounding the memory a malicious or
+/// compromised AIA endpoint can force the validator to buffer.
+const MAX_CERT_BODY_SIZE: usize = 1024 * 1024;
+
 /// Certificate chain builder.
 ///
 /// Discovers and fetches intermediate certificates by following AIA
 /// `caIssuers` extensions, building a chain up to a trust anchor.
+///
+/// AIA `caIssuers` URLs are carried inside the (attacker-influenced) certificate
+/// under validation, so fetching them is an SSRF surface. The default client is
+/// built with [`crate::net::hardened_http_client`] and every URL is run through
+/// [`crate::net::validate_fetch_url`] before egress: fetches are restricted to
+/// `http`/`https` and the resolved host must be a public address (loopback,
+/// private, link-local/metadata, unique-local, multicast, and CGNAT ranges are
+/// refused). Fetched bodies are capped at [`MAX_CERT_BODY_SIZE`]. These are the
+/// same controls the CRL fetch path uses (ADR-0010), shared via [`crate::net`].
 #[derive(Debug, Clone)]
 pub struct ChainBuilder {
     http_client: Client,
     timeout: Duration,
+    /// Maximum response body size for a fetched certificate (1 MiB default).
+    max_body_size: usize,
 }
 
 impl ChainBuilder {
     /// Create a new chain builder with default settings.
+    ///
+    /// The default HTTP client is SSRF-hardened (bounded, internal-address-aware
+    /// redirect policy); see [`ChainBuilder`].
     pub fn new() -> Self {
         Self {
-            http_client: Client::new(),
+            http_client: crate::net::hardened_http_client(),
             timeout: Duration::from_secs(30),
+            max_body_size: MAX_CERT_BODY_SIZE,
         }
     }
 
     /// Set the HTTP client.
+    ///
+    /// The supplied client is used verbatim; if you replace the default,
+    /// preserve a bounded, internal-address-aware redirect policy
+    /// (see [`crate::net::hardened_http_client`]) so the redirect-to-internal
+    /// SSRF bypass stays closed.
     pub fn http_client(mut self, client: Client) -> Self {
         self.http_client = client;
         self
@@ -44,6 +71,12 @@ impl ChainBuilder {
     /// Set the request timeout.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Set the maximum response body size for a fetched certificate.
+    pub fn max_body_size(mut self, max: usize) -> Self {
+        self.max_body_size = max;
         self
     }
 
@@ -184,8 +217,29 @@ impl ChainBuilder {
     }
 
     /// Fetch a certificate from a URL.
+    ///
+    /// The URL comes from an attacker-influenced AIA `caIssuers` extension, so
+    /// it is validated against the SSRF guard (`http`/`https` scheme allowlist
+    /// **and** resolved-IP filtering) before any network egress, and the
+    /// response body is capped at `self.max_body_size`. These mirror the CRL
+    /// fetch path (ADR-0010) via the shared [`crate::net`] helper.
     async fn fetch_certificate(&self, url: &str) -> Result<Certificate, LtvError> {
         log::debug!("Fetching CA certificate from {url}");
+
+        // SSRF guard: validate scheme *and* that the host resolves to a public
+        // address before any network egress. A cert's AIA caIssuers URL is
+        // attacker-controlled. The guard's DNS resolution is bounded by the same
+        // timeout as the HTTP GET so a slow/blocked resolver cannot make this
+        // exceed `self.timeout`.
+        match tokio::time::timeout(self.timeout, crate::net::validate_fetch_url(url)).await {
+            Ok(result) => result.map_err(|e| LtvError::Chain(format!("AIA caIssuers {e}")))?,
+            Err(_) => {
+                return Err(LtvError::Chain(format!(
+                    "AIA caIssuers URL validation timed out after {:?}",
+                    self.timeout
+                )))
+            }
+        }
 
         let response = self
             .http_client
@@ -202,11 +256,35 @@ impl ChainBuilder {
             )));
         }
 
-        let cert_bytes = response
-            .bytes()
-            .await
-            .map_err(|e| LtvError::Chain(format!("failed to read cert response: {e}")))?
-            .to_vec();
+        // Reject up front if the advertised Content-Length already exceeds the
+        // cap, so an oversized body is never even streamed.
+        if let Some(len) = response.content_length() {
+            if len > self.max_body_size as u64 {
+                return Err(LtvError::Chain(format!(
+                    "cert from {url} exceeds max body size ({len} > {})",
+                    self.max_body_size
+                )));
+            }
+        }
+
+        // Stream the body and abort as soon as the accumulated bytes exceed the
+        // cap, bounding peak memory even when Content-Length is absent or lies.
+        let mut cert_bytes: Vec<u8> = Vec::new();
+        let mut response = response;
+        loop {
+            let chunk = response
+                .chunk()
+                .await
+                .map_err(|e| LtvError::Chain(format!("failed to read cert response: {e}")))?;
+            let Some(chunk) = chunk else { break };
+            if cert_bytes.len() + chunk.len() > self.max_body_size {
+                return Err(LtvError::Chain(format!(
+                    "cert from {url} exceeds max body size (> {})",
+                    self.max_body_size
+                )));
+            }
+            cert_bytes.extend_from_slice(&chunk);
+        }
 
         // Try DER first, then PEM
         if let Ok(cert) = Certificate::from_der(&cert_bytes) {
@@ -245,6 +323,45 @@ mod tests {
     fn test_chain_builder_default() {
         let builder = ChainBuilder::new();
         assert_eq!(builder.timeout, Duration::from_secs(30));
+        assert_eq!(builder.max_body_size, MAX_CERT_BODY_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_certificate_rejects_private_ip_aia_url() {
+        // B1: an AIA caIssuers URL pointing at a private/loopback/metadata
+        // address must be refused before any network egress (SSRF guard).
+        let builder = ChainBuilder::new();
+        for url in [
+            "http://127.0.0.1/ca.crt",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/ca.crt",
+            "http://[::1]/ca.crt",
+        ] {
+            let err = builder
+                .fetch_certificate(url)
+                .await
+                .expect_err("private/loopback AIA URL must be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("non-public") || msg.contains("SSRF"),
+                "expected SSRF rejection for {url}, got: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_certificate_rejects_non_http_scheme() {
+        // B1: non-web schemes (file://, gopher://) are refused by the scheme
+        // allowlist before egress.
+        let builder = ChainBuilder::new();
+        let err = builder
+            .fetch_certificate("file:///etc/passwd")
+            .await
+            .expect_err("non-http AIA URL must be rejected");
+        assert!(
+            format!("{err}").contains("scheme not allowed"),
+            "expected scheme rejection, got: {err}"
+        );
     }
 
     #[test]

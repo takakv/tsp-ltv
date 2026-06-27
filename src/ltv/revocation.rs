@@ -243,7 +243,14 @@ pub async fn check_certificate_revocation(
     validation_time: Option<DateTime<Utc>>,
 ) -> ValidationStatus {
     // Run OCSP and CRL checks concurrently with a per-cert timeout
-    let ocsp_fut = run_ocsp_check(cert, issuer, config, ocsp_client, validation_time);
+    let ocsp_fut = run_ocsp_check(
+        cert,
+        issuer,
+        config,
+        crl_client,
+        ocsp_client,
+        validation_time,
+    );
     let crl_fut = run_crl_check(cert, issuer, config, crl_client, validation_time);
 
     // Use tokio::join! for concurrent execution, wrapped in a timeout
@@ -372,6 +379,7 @@ async fn run_ocsp_check(
     cert: &Certificate,
     issuer: &Certificate,
     config: &RevocationConfig,
+    crl_client: &CrlClient,
     ocsp_client: &OcspClient,
     validation_time: Option<DateTime<Utc>>,
 ) -> ValidationStatus {
@@ -415,7 +423,7 @@ async fn run_ocsp_check(
         // status (tryLater, internalError, unauthorized, ...) is non-
         // determinative and stays Unknown — so a temporary responder outage
         // does not become a hard failure under best-effort/offline policy.
-        match ocsp::check_revocation_with_options(
+        let outcome = match ocsp::check_revocation_detailed(
             &response_der,
             cert,
             issuer,
@@ -424,9 +432,55 @@ async fn run_ocsp_check(
             &config.signature_policy,
             &config.ocsp_freshness,
         ) {
-            Ok(status) => status,
-            Err(e) => ocsp_check_error_to_status(e),
+            Ok(outcome) => outcome,
+            Err(e) => return ocsp_check_error_to_status(e),
+        };
+
+        // RFC 6960 §4.2.2.2.1: a delegated responder lacking
+        // id-pkix-ocsp-nocheck must itself be revocation-checked. If its own
+        // status is Revoked — or definitively Invalid (e.g. an exhausted
+        // recursion budget on a nested delegation, or an integrity failure on
+        // the responder's own revocation data) — the OCSP response cannot be
+        // trusted, so we fail closed (Invalid). Only an Unknown/unreachable
+        // responder-revocation result is tolerated: it does not invalidate an
+        // otherwise-good response on its own (the response's own
+        // freshness/signature already passed) and is left to the overall
+        // policy. Recursion is bounded by `max_ocsp_recursion` so a responder
+        // that itself uses a delegated responder cannot loop unboundedly.
+        if let Some(responder) = &outcome.delegated_responder {
+            if config.max_ocsp_recursion == 0 {
+                // No budget to check the responder's own status. Fail closed:
+                // an unchecked delegated responder is not trustworthy.
+                return ValidationStatus::Invalid {
+                    reason: "delegated OCSP responder lacks id-pkix-ocsp-nocheck and \
+                             responder-revocation checking is disabled (max_ocsp_recursion = 0)"
+                        .into(),
+                };
+            }
+            // Box the recursive call to break the async-recursion cycle
+            // (run_ocsp_check → here → run_ocsp_check), bounded by
+            // `max_ocsp_recursion`.
+            let responder_status: ValidationStatus =
+                Box::pin(check_delegated_responder_revocation(
+                    responder,
+                    issuer,
+                    config,
+                    crl_client,
+                    ocsp_client,
+                    validation_time,
+                ))
+                .await;
+            if responder_status.is_revoked() || responder_status.is_invalid() {
+                return ValidationStatus::Invalid {
+                    reason: format!(
+                        "delegated OCSP responder certificate could not be confirmed \
+                         unrevoked: {responder_status}"
+                    ),
+                };
+            }
         }
+
+        outcome.status
     })
     .await;
 
@@ -439,6 +493,73 @@ async fn run_ocsp_check(
             }
         }
     }
+}
+
+/// Check the revocation status of a *delegated* OCSP responder certificate
+/// (RFC 6960 §4.2.2.2.1) against its issuing CA.
+///
+/// Runs the same OCSP+CRL machinery as a normal certificate, but with
+/// `max_ocsp_recursion` decremented so a responder that is itself served by a
+/// delegated responder cannot recurse without bound. `require_revocation_check`
+/// is relaxed for this sub-check: an *unreachable* responder-revocation source
+/// must not, by itself, turn an otherwise-valid response into a hard failure —
+/// only a definitively **Revoked** responder does (handled by the caller). The
+/// merged status is returned without the fail-closed upgrade.
+async fn check_delegated_responder_revocation(
+    responder: &Certificate,
+    ca_issuer: &Certificate,
+    config: &RevocationConfig,
+    crl_client: &CrlClient,
+    ocsp_client: &OcspClient,
+    validation_time: Option<DateTime<Utc>>,
+) -> ValidationStatus {
+    let sub_config = RevocationConfig {
+        // Decrement the recursion budget; bottom out at 0 (the OCSP path treats
+        // a delegated responder with no remaining budget as fail-closed).
+        max_ocsp_recursion: config.max_ocsp_recursion.saturating_sub(1),
+        // Do not upgrade Unknown→Invalid here: an unreachable responder-status
+        // source must not invalidate the (already-validated) primary response.
+        require_revocation_check: false,
+        ..config.clone()
+    };
+
+    // Run OCSP and CRL concurrently for the responder, bounded by the same
+    // per-cert timeout. This intentionally does NOT recurse through
+    // `check_certificate_revocation` (which would re-apply the strict policy);
+    // it calls the inner checks directly with the relaxed sub-config.
+    let ocsp_fut = run_ocsp_check(
+        responder,
+        ca_issuer,
+        &sub_config,
+        crl_client,
+        ocsp_client,
+        validation_time,
+    );
+    let crl_fut = run_crl_check(
+        responder,
+        ca_issuer,
+        &sub_config,
+        crl_client,
+        validation_time,
+    );
+
+    let (ocsp_status, crl_status) = match tokio::time::timeout(config.per_cert_timeout, async {
+        tokio::join!(ocsp_fut, crl_fut)
+    })
+    .await
+    {
+        Ok(pair) => pair,
+        Err(_) => (
+            ValidationStatus::Unknown {
+                reason: "responder OCSP check timed out".into(),
+            },
+            ValidationStatus::Unknown {
+                reason: "responder CRL check timed out".into(),
+            },
+        ),
+    };
+
+    resolve_priority(ocsp_status, crl_status)
 }
 
 // ── Internal: CRL check ───────────────────────────────────────────
