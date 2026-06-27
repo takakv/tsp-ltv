@@ -120,7 +120,7 @@ fn parse_key_cert_sign_bit(extn_value: &[u8]) -> Result<bool, TrustError> {
 fn validate_intermediate_ca_extensions(cert: &Certificate, label: &str) -> Result<(), TrustError> {
     let (is_ca, _) = basic_constraints(cert)?;
     if !is_ca {
-        return Err(TrustError::SignatureVerification(format!(
+        return Err(TrustError::ProfileViolation(format!(
             "{label} is not a CA (basicConstraints cA is not TRUE)"
         )));
     }
@@ -130,7 +130,7 @@ fn validate_intermediate_ca_extensions(cert: &Certificate, label: &str) -> Resul
         Some(true) | None => Ok(()),
         // keyUsage present but does NOT assert keyCertSign — the key must not be
         // used to verify certificate signatures.
-        Some(false) => Err(TrustError::SignatureVerification(format!(
+        Some(false) => Err(TrustError::ProfileViolation(format!(
             "{label} keyUsage is present but does not assert keyCertSign"
         ))),
     }
@@ -146,9 +146,7 @@ fn enforce_path_len(
     label: &str,
 ) -> Result<(), TrustError> {
     let (_is_ca, path_len) = basic_constraints(issuer).map_err(|e| {
-        TrustError::SignatureVerification(format!(
-            "failed to parse basicConstraints for {label}: {e}"
-        ))
+        TrustError::ProfileViolation(format!("failed to parse basicConstraints for {label}: {e}"))
     })?;
     let Some(max_depth) = path_len else {
         return Ok(());
@@ -160,7 +158,7 @@ fn enforce_path_len(
     let mut subordinate_ca_count = 0u64;
     for cert in below {
         let (is_ca, _) = basic_constraints(cert).map_err(|e| {
-            TrustError::SignatureVerification(format!(
+            TrustError::ProfileViolation(format!(
                 "failed to parse basicConstraints below {label}: {e}"
             ))
         })?;
@@ -169,7 +167,7 @@ fn enforce_path_len(
         }
     }
     if subordinate_ca_count > max_depth {
-        return Err(TrustError::SignatureVerification(format!(
+        return Err(TrustError::ProfileViolation(format!(
             "pathLenConstraint ({max_depth}) exceeded for {label}: {subordinate_ca_count} non-self-issued subordinate CA certs below"
         )));
     }
@@ -264,7 +262,7 @@ fn reject_unknown_critical_extensions(cert: &Certificate, label: &str) -> Result
             }
         }
         if !recognized {
-            return Err(TrustError::SignatureVerification(format!(
+            return Err(TrustError::ProfileViolation(format!(
                 "{label} has an unrecognized critical extension {oid} (RFC 5280 §4.2 MUST reject)"
             )));
         }
@@ -318,7 +316,7 @@ fn name_constraint_to_trust_error(
     e: crate::ltv::name_constraints::NameConstraintError,
 ) -> TrustError {
     let subject = format!("{}", cert.tbs_certificate.subject);
-    TrustError::SignatureVerification(format!("certificate '{subject}': {e}"))
+    TrustError::ProfileViolation(format!("certificate '{subject}': {e}"))
 }
 
 /// A trust anchor: a parsed certificate paired with its DER encoding.
@@ -483,6 +481,13 @@ impl TrustStore {
     /// trust-anchor set is smaller than the directory's contents — the caller
     /// MUST decide whether that is acceptable rather than have the decision made
     /// silently for them.
+    ///
+    /// One special case: if enumerating a directory *entry* itself fails (a
+    /// transient FS fault or a permission error, so the file name is unknown),
+    /// the skip is still reported, but with the **directory** path (not a file
+    /// path) and a `reason` beginning `directory entry error:`. Callers that need
+    /// to tell file-level skips apart can key off that prefix / the path being
+    /// the directory.
     pub fn from_pem_directory_lenient(
         dir: impl AsRef<Path>,
     ) -> Result<(Self, Vec<(std::path::PathBuf, String)>), TrustError> {
@@ -765,7 +770,7 @@ impl TrustStore {
         #[cfg(feature = "ltv")]
         if let Some(role) = leaf_purpose {
             crate::ltv::validate_extensions_for_role(&chain[0], role).map_err(|e| {
-                TrustError::SignatureVerification(format!(
+                TrustError::ProfileViolation(format!(
                     "leaf certificate does not satisfy required purpose {role}: {e}"
                 ))
             })?;
@@ -1145,7 +1150,7 @@ mod tests {
             .verify_chain(&chain, None)
             .expect_err("pathLen=0 with a CA leaf below must be rejected");
         assert!(
-            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("pathLenConstraint")),
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("pathLenConstraint")),
             "expected pathLenConstraint rejection, got: {err:?}"
         );
     }
@@ -1230,7 +1235,7 @@ mod tests {
             .verify_chain(&chain, None)
             .expect_err("anchor pathLen=0 with CAs below must be rejected");
         assert!(
-            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("pathLenConstraint") && m.contains("trust anchor")),
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("pathLenConstraint") && m.contains("trust anchor")),
             "expected trust-anchor pathLenConstraint rejection, got: {err:?}"
         );
     }
@@ -1381,7 +1386,7 @@ mod tests {
             .verify_chain(&chain, None)
             .expect_err("a non-CA intermediate must be rejected");
         assert!(
-            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("not a CA")),
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("not a CA")),
             "expected non-CA intermediate rejection, got: {err:?}"
         );
     }
@@ -1435,7 +1440,7 @@ mod tests {
             .verify_chain(&chain, None)
             .expect_err("a non-CA trust anchor must be rejected");
         assert!(
-            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("trust anchor") && m.contains("not a CA")),
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("trust anchor") && m.contains("not a CA")),
             "expected non-CA trust-anchor rejection, got: {err:?}"
         );
     }
@@ -1504,7 +1509,7 @@ mod tests {
             .verify_chain(&chain, None)
             .expect_err("unknown critical extension must be rejected");
         assert!(
-            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("unrecognized critical extension")),
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("unrecognized critical extension")),
             "expected unrecognized-critical-extension rejection, got: {err:?}"
         );
     }
@@ -1555,7 +1560,7 @@ mod tests {
             .verify_chain(&[san_root], None)
             .expect_err("critical subjectAltName must be rejected in a tsp-only build");
         assert!(
-            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("unrecognized critical extension")),
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("unrecognized critical extension")),
             "expected unrecognized-critical-extension rejection, got: {err:?}"
         );
 
@@ -1630,7 +1635,7 @@ mod tests {
             .verify_chain_for_purpose(&chain, None, CertRole::OcspResponder)
             .expect_err("leaf without OCSPSigning EKU must fail OcspResponder purpose");
         assert!(
-            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("required purpose")),
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("required purpose")),
             "expected purpose-binding rejection, got: {err:?}"
         );
     }
@@ -1745,7 +1750,7 @@ mod tests {
             .verify_chain(&chain, None)
             .expect_err("SAN outside permitted subtree must be rejected");
         assert!(
-            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("name constraint")),
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("name constraint")),
             "expected name-constraint violation, got: {err:?}"
         );
     }
@@ -1770,7 +1775,7 @@ mod tests {
             .verify_chain(&chain, None)
             .expect_err("SAN within excluded subtree must be rejected");
         assert!(
-            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("name constraint")),
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("name constraint")),
             "expected excluded-subtree violation, got: {err:?}"
         );
     }
@@ -1837,7 +1842,7 @@ mod tests {
             .verify_chain(&chain, None)
             .expect_err("unsupported name-constraint type must fail closed");
         assert!(
-            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("unsupported name constraint")),
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("unsupported name constraint")),
             "expected unsupported-name-constraint rejection, got: {err:?}"
         );
     }

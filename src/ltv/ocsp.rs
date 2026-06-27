@@ -1255,13 +1255,14 @@ fn responder_matches_responder_id(
             Ok(())
         }
         ResponderId::ByKeyHash(key_hash) => {
+            // Hash the SPKI public-key bit-string slice directly; no need to
+            // allocate a temporary Vec on every OCSP response verification.
             let key_bytes = responder_cert
                 .tbs_certificate
                 .subject_public_key_info
                 .subject_public_key
-                .raw_bytes()
-                .to_vec();
-            let computed = sha1_hash(&key_bytes);
+                .raw_bytes();
+            let computed = sha1_hash(key_bytes);
             if &computed != key_hash {
                 return Err(LtvError::Ocsp(
                     "OCSP responder certificate key hash does not match responderID (byKeyHash)"

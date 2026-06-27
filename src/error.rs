@@ -88,6 +88,14 @@ pub enum TrustError {
     #[error("signature verification failed: {0}")]
     SignatureVerification(String),
 
+    /// An RFC 5280 certificate-profile / path-validation rule was violated:
+    /// basicConstraints/keyUsage, pathLenConstraint, an unrecognized critical
+    /// extension, name constraints, or leaf purpose binding. Distinct from
+    /// [`SignatureVerification`](Self::SignatureVerification), which is a
+    /// cryptographic signature failure.
+    #[error("certificate profile violation: {0}")]
+    ProfileViolation(String),
+
     #[error("unsupported signature algorithm: {0}")]
     UnsupportedAlgorithm(String),
 
