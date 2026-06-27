@@ -452,8 +452,17 @@ impl TrustStore {
                         ))
                     })?;
                     store.add_anchor_file_data(&data).map_err(|e| {
+                        // `add_anchor_file_data` already returns a TrustError;
+                        // unwrap a CertificateParse to its inner message so the
+                        // re-wrapped error is not double-prefixed
+                        // ("certificate parse error: ...: certificate parse
+                        // error: ..."), while still naming the offending file.
+                        let detail = match e {
+                            TrustError::CertificateParse(m) => m,
+                            other => other.to_string(),
+                        };
                         TrustError::CertificateParse(format!(
-                            "failed to parse trust anchor file {}: {e}",
+                            "failed to parse trust anchor file {}: {detail}",
                             path.display()
                         ))
                     })?;
@@ -1858,6 +1867,14 @@ mod tests {
         assert!(
             matches!(err, TrustError::CertificateParse(ref m) if m.contains("bad.pem")),
             "error should name the offending file, got: {err:?}"
+        );
+        // The inner TrustError message is unwrapped, so the Display prefix is
+        // not duplicated ("certificate parse error: ...: certificate parse
+        // error: ...").
+        assert_eq!(
+            err.to_string().matches("certificate parse error").count(),
+            1,
+            "error prefix should not be duplicated: {err}"
         );
     }
 
