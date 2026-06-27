@@ -246,9 +246,17 @@ impl OcspClient {
 
     /// Send an OCSP request to the given URL.
     async fn send_ocsp_request(&self, url: &str, request_der: &[u8]) -> Result<Vec<u8>, LtvError> {
-        crate::net::validate_fetch_url(url)
-            .await
-            .map_err(|e| LtvError::Ocsp(format!("URL rejected: {e}")))?;
+        // Bound the SSRF guard's DNS resolution by the same timeout as the HTTP
+        // request, so a slow/blocked resolver cannot hang past `self.timeout`.
+        match tokio::time::timeout(self.timeout, crate::net::validate_fetch_url(url)).await {
+            Ok(result) => result.map_err(|e| LtvError::Ocsp(format!("URL rejected: {e}")))?,
+            Err(_) => {
+                return Err(LtvError::Ocsp(format!(
+                    "URL validation timed out after {:?}",
+                    self.timeout
+                )))
+            }
+        }
 
         log::debug!(
             "Sending OCSP request to {url} ({} bytes)",

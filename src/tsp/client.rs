@@ -135,10 +135,26 @@ impl TsaClient {
     ///
     /// Returns the raw DER-encoded TimeStampToken (a CMS ContentInfo
     /// wrapping SignedData with TSTInfo as the encapsulated content).
+    ///
+    /// Before any network egress the TSA URL is validated by the SSRF guard
+    /// ([`crate::net::validate_fetch_url`]): a non-`http`/`https` scheme or a
+    /// host that resolves to a non-public address is **rejected** rather than
+    /// fetched. That validation includes a DNS lookup; it is bounded by the
+    /// configured [`timeout`](Self::timeout) so a slow resolver cannot block
+    /// past it, and the total wall-clock can be up to roughly twice `timeout`
+    /// (validation then the HTTP request).
     pub async fn timestamp(&self, data_hash: &[u8]) -> Result<Vec<u8>, TspError> {
-        crate::net::validate_fetch_url(&self.url)
-            .await
-            .map_err(|e| TspError::HttpError(format!("URL rejected: {e}")))?;
+        // Bound the SSRF guard's DNS resolution by the request timeout so a
+        // slow/blocked resolver cannot hang longer than `self.timeout`.
+        match tokio::time::timeout(self.timeout, crate::net::validate_fetch_url(&self.url)).await {
+            Ok(result) => result.map_err(|e| TspError::HttpError(format!("URL rejected: {e}")))?,
+            Err(_) => {
+                return Err(TspError::HttpError(format!(
+                    "URL validation for {} timed out after {:?}",
+                    self.url, self.timeout
+                )))
+            }
+        }
 
         // Generate nonce for replay protection
         let nonce = token::generate_nonce();

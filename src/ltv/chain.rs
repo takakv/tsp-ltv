@@ -228,10 +228,18 @@ impl ChainBuilder {
 
         // SSRF guard: validate scheme *and* that the host resolves to a public
         // address before any network egress. A cert's AIA caIssuers URL is
-        // attacker-controlled.
-        crate::net::validate_fetch_url(url)
-            .await
-            .map_err(|e| LtvError::Chain(format!("AIA caIssuers {e}")))?;
+        // attacker-controlled. The guard's DNS resolution is bounded by the same
+        // timeout as the HTTP GET so a slow/blocked resolver cannot make this
+        // exceed `self.timeout`.
+        match tokio::time::timeout(self.timeout, crate::net::validate_fetch_url(url)).await {
+            Ok(result) => result.map_err(|e| LtvError::Chain(format!("AIA caIssuers {e}")))?,
+            Err(_) => {
+                return Err(LtvError::Chain(format!(
+                    "AIA caIssuers URL validation timed out after {:?}",
+                    self.timeout
+                )))
+            }
+        }
 
         let response = self
             .http_client
