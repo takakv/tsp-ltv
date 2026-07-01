@@ -843,9 +843,7 @@ where
     use dsa::signature::DigestVerifier;
     use dsa::{Signature, VerifyingKey};
 
-    let spki = spki::SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
-    let vk = VerifyingKey::try_from(spki)
+    let vk = VerifyingKey::try_from(decode_spki(spki_der)?)
         .map_err(|e| TrustError::SignatureVerification(format!("DSA key decode: {e}")))?;
     let signature = Signature::from_der(sig)
         .map_err(|e| TrustError::SignatureVerification(format!("DSA sig decode: {e}")))?;
