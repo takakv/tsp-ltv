@@ -924,10 +924,13 @@ mod tests {
             &OID_DSA_WITH_SHA1,
             &SignaturePolicy::allow_legacy(),
         );
-        let err_msg = format!("{}", result.unwrap_err());
+        // Match the variant, not the message text: the OID must reach the DSA
+        // branch (failing at SPKI decode with SignatureVerification), never fall
+        // through to UnsupportedAlgorithm.
+        let err = result.unwrap_err();
         assert!(
-            !err_msg.contains("unsupported"),
-            "DSA-SHA1 should be dispatched, not unsupported: {err_msg}"
+            !matches!(err, TrustError::UnsupportedAlgorithm(_)),
+            "DSA-SHA1 should be dispatched to the DSA branch, not UnsupportedAlgorithm: {err:?}"
         );
     }
 
@@ -943,10 +946,44 @@ mod tests {
             &OID_DSA_WITH_SHA256,
             &SignaturePolicy::strict(),
         );
-        let err_msg = format!("{}", result.unwrap_err());
+        // Match the variant, not the message text.
+        let err = result.unwrap_err();
         assert!(
-            !err_msg.contains("unsupported"),
-            "DSA-SHA256 should be dispatched, not unsupported: {err_msg}"
+            !matches!(err, TrustError::UnsupportedAlgorithm(_)),
+            "DSA-SHA256 should be dispatched to the DSA branch, not UnsupportedAlgorithm: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_dsa_sha256_self_signed_under_strict() {
+        // Positive path: a self-signed DSA (DSS) CA certificate signed with
+        // dsa-with-SHA256 exercises verify_dsa_signature::<Sha256> for real.
+        // dsa-with-SHA256 is not a weak-digest algorithm, so it verifies under
+        // the default strict policy.
+        let dsa_pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/dsa_sha256_ca_cert.pem"
+        ));
+        let dsa = load_test_cert(dsa_pem);
+
+        let ok = verify_certificate_signature(&dsa, &dsa);
+        assert!(
+            ok.is_ok(),
+            "DSA-SHA256 self-signature should verify under strict: {ok:?}"
+        );
+
+        // Verifying against a different DSA key (the SHA-1 CA) must fail: the
+        // signature is real DSA-SHA256, but the domain parameters / public value
+        // are wrong.
+        let other_pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/dsa_ca_cert.pem"
+        ));
+        let other = load_test_cert(other_pem);
+        let bad = verify_certificate_signature(&dsa, &other);
+        assert!(
+            matches!(bad, Err(TrustError::SignatureVerification(_))),
+            "DSA-SHA256 cert must fail against the wrong issuer key: {bad:?}"
         );
     }
 
