@@ -227,6 +227,7 @@ pub fn is_weak_signature_oid(oid: &const_oid::ObjectIdentifier) -> bool {
 /// | `1.2.840.113549.1.1.5`  | SHA-1 with RSA (legacy) | rejected |
 /// | `1.2.840.113549.1.1.14` | SHA-224 with RSA (legacy) | rejected |
 /// | `1.2.840.10045.4.1`     | ECDSA with SHA-1 (legacy) | rejected |
+/// | `1.2.840.10040.4.3`     | DSA (DSS) with SHA-1 (legacy) | rejected |
 /// | `1.2.840.113549.1.1.11` | SHA-256 with RSA | accepted |
 /// | `1.2.840.113549.1.1.12` | SHA-384 with RSA | accepted |
 /// | `1.2.840.113549.1.1.13` | SHA-512 with RSA | accepted |
@@ -234,6 +235,7 @@ pub fn is_weak_signature_oid(oid: &const_oid::ObjectIdentifier) -> bool {
 /// | `1.2.840.10045.4.3.2`   | ECDSA with SHA-256 | accepted |
 /// | `1.2.840.10045.4.3.3`   | ECDSA with SHA-384 | accepted |
 /// | `1.2.840.10045.4.3.4`   | ECDSA with SHA-512 | accepted |
+/// | `2.16.840.1.101.3.4.3.2` | DSA (DSS) with SHA-256 | accepted |
 /// | `1.3.101.112`           | Ed25519 | accepted |
 pub fn verify_signature_by_oid(
     tbs_bytes: &[u8],
@@ -926,6 +928,25 @@ mod tests {
         assert!(
             !err_msg.contains("unsupported"),
             "DSA-SHA1 should be dispatched, not unsupported: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_dsa_sha256_oid_dispatches_not_unsupported() {
+        // The DSA-with-SHA256 OID must reach the DSA branch (failing at SPKI/key
+        // decode), never fall through to UnsupportedAlgorithm. dsa-with-SHA256 is
+        // not weak, so it is reachable under the default strict policy.
+        let result = verify_signature_by_oid_with_policy(
+            b"tbs",
+            b"sig",
+            b"bad_spki",
+            &OID_DSA_WITH_SHA256,
+            &SignaturePolicy::strict(),
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            !err_msg.contains("unsupported"),
+            "DSA-SHA256 should be dispatched, not unsupported: {err_msg}"
         );
     }
 
