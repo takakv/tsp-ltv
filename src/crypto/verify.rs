@@ -11,6 +11,7 @@
 //! - ECDSA P-384 with SHA-384
 //! - ECDSA P-521 with SHA-512
 //! - Ed25519
+//! - DSA (DSS) with SHA-1 (legacy) and SHA-256
 //!
 //! ## Weak-algorithm policy (H-1)
 //!
@@ -39,8 +40,8 @@
 //! accepted via the trust store's policy above.
 
 use crate::crypto::algorithm::{
-    DigestAlgorithm, OID_ECDSA_WITH_SHA1, OID_ED25519, OID_MD5_WITH_RSA, OID_RSASSA_PSS,
-    OID_SHA1_WITH_RSA, OID_SHA224_WITH_RSA,
+    DigestAlgorithm, OID_DSA_WITH_SHA1, OID_DSA_WITH_SHA256, OID_ECDSA_WITH_SHA1, OID_ED25519,
+    OID_MD5_WITH_RSA, OID_RSASSA_PSS, OID_SHA1_WITH_RSA, OID_SHA224_WITH_RSA,
 };
 use crate::error::TrustError;
 
@@ -209,6 +210,7 @@ pub fn is_weak_signature_oid(oid: &const_oid::ObjectIdentifier) -> bool {
         || *oid == OID_SHA1_WITH_RSA
         || *oid == OID_SHA224_WITH_RSA
         || *oid == OID_ECDSA_WITH_SHA1
+        || *oid == OID_DSA_WITH_SHA1
 }
 
 /// Verify a raw signature over `tbs_bytes` using the signer's SPKI (DER) and the
@@ -304,6 +306,14 @@ pub fn verify_signature_by_oid_with_policy(
     // --- Legacy ECDSA (only reachable under allow_legacy) ---
     else if *sig_alg_oid == OID_ECDSA_WITH_SHA1 {
         verify_ecdsa_bound(tbs_bytes, signature_bytes, spki_der, EcdsaHash::Sha1)
+    }
+    // --- Legacy DSA/DSS with SHA-1 (only reachable under allow_legacy) ---
+    else if *sig_alg_oid == OID_DSA_WITH_SHA1 {
+        verify_dsa_signature::<sha1::Sha1>(tbs_bytes, signature_bytes, spki_der)
+    }
+    // --- DSA/DSS with SHA-256 ---
+    else if *sig_alg_oid == OID_DSA_WITH_SHA256 {
+        verify_dsa_signature::<sha2::Sha256>(tbs_bytes, signature_bytes, spki_der)
     }
     // --- Modern ECDSA — the curve is taken from the key (L-8) ---
     else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_256 {
@@ -817,6 +827,31 @@ pub fn verify_ed25519_signature(tbs: &[u8], sig: &[u8], spki_der: &[u8]) -> Resu
         .map_err(|e| TrustError::SignatureVerification(format!("Ed25519 invalid: {e}")))
 }
 
+/// Verify a DSA (DSS) certificate/CRL/OCSP signature.
+///
+/// `D` selects the digest implied by the signature-algorithm OID (SHA-1 for the
+/// legacy `dsaWithSHA1`, SHA-256 for `dsa-with-SHA256`). The issuer's DSA domain
+/// parameters (p, q, g) and public value `y` are read from `spki_der`; the
+/// signature is the DER-encoded `SEQUENCE { r, s }` carried in the certificate.
+fn verify_dsa_signature<D>(tbs: &[u8], sig: &[u8], spki_der: &[u8]) -> Result<(), TrustError>
+where
+    D: digest::Digest,
+{
+    use der::Decode;
+    use dsa::signature::DigestVerifier;
+    use dsa::{Signature, VerifyingKey};
+
+    let spki = spki::SubjectPublicKeyInfoRef::from_der(spki_der)
+        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
+    let vk = VerifyingKey::try_from(spki)
+        .map_err(|e| TrustError::SignatureVerification(format!("DSA key decode: {e}")))?;
+    let signature = Signature::from_der(sig)
+        .map_err(|e| TrustError::SignatureVerification(format!("DSA sig decode: {e}")))?;
+
+    vk.verify_digest(D::new_with_prefix(tbs), &signature)
+        .map_err(|e| TrustError::SignatureVerification(format!("DSA invalid: {e}")))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -844,6 +879,53 @@ mod tests {
         assert!(
             result.is_ok(),
             "CA self-signature should verify: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_dsa_sha1_self_signed_under_legacy() {
+        // A self-signed DSA (DSS) CA certificate signed with dsaWithSHA1. Its own
+        // SPKI carries the DSA domain parameters and public value, so it verifies
+        // against itself. dsaWithSHA1 is SHA-1 based, so it is only accepted under
+        // the legacy policy.
+        let dsa_pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/dsa_ca_cert.pem"
+        ));
+        let dsa = load_test_cert(dsa_pem);
+
+        let ok =
+            verify_certificate_signature_with_policy(&dsa, &dsa, &SignaturePolicy::allow_legacy());
+        assert!(
+            ok.is_ok(),
+            "DSA self-signature should verify under legacy: {ok:?}"
+        );
+
+        // Under the strict policy, dsaWithSHA1 is rejected as a weak-digest
+        // algorithm before any key material is touched.
+        let strict =
+            verify_certificate_signature_with_policy(&dsa, &dsa, &SignaturePolicy::strict());
+        assert!(
+            matches!(strict, Err(TrustError::WeakAlgorithm(_))),
+            "dsaWithSHA1 must be rejected as weak under strict policy: {strict:?}"
+        );
+    }
+
+    #[test]
+    fn test_dsa_oid_dispatches_not_unsupported() {
+        // The DSA OID must reach the DSA branch (failing at SPKI/key decode),
+        // never fall through to UnsupportedAlgorithm.
+        let result = verify_signature_by_oid_with_policy(
+            b"tbs",
+            b"sig",
+            b"bad_spki",
+            &OID_DSA_WITH_SHA1,
+            &SignaturePolicy::allow_legacy(),
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            !err_msg.contains("unsupported"),
+            "DSA-SHA1 should be dispatched, not unsupported: {err_msg}"
         );
     }
 

@@ -67,6 +67,13 @@ pub const OID_SHA224_WITH_RSA: ObjectIdentifier =
 /// OID for ECDSA with SHA-1: `1.2.840.10045.4.1`
 pub const OID_ECDSA_WITH_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.1");
 
+/// OID for DSA (DSS) with SHA-1: `1.2.840.10040.4.3` (legacy, SHA-1 based).
+pub const OID_DSA_WITH_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10040.4.3");
+
+/// OID for DSA (DSS) with SHA-256: `2.16.840.1.101.3.4.3.2`.
+pub const OID_DSA_WITH_SHA256: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.2");
+
 // ── DigestAlgorithm ─────────────────────────────────────────────────────
 
 /// Supported digest (hash) algorithms.

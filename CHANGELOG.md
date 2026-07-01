@@ -1,6 +1,18 @@
 # Changelog
 
 
+## 0.3.1 [2026-07-01]
+
+### Added
+
+- DSA (DSS) certificate/CRL/OCSP signature verification: `dsaWithSHA1`
+  (`1.2.840.10040.4.3`, legacy) and `dsa-with-SHA256` (`2.16.840.1.101.3.4.3.2`).
+  The DSA domain parameters and public value are read from the issuer's SPKI.
+  `dsaWithSHA1` is treated as a weak-digest algorithm — rejected under the strict
+  [`SignaturePolicy`] and accepted only under `allow_legacy()`, consistent with
+  the existing SHA-1/MD5 handling.
+
+
 ## 0.3.0 [2026-06-27]
 
 Chain-validation hardening: AIA SSRF guard, critical-extension rejection, leaf
