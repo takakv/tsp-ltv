@@ -164,7 +164,7 @@ impl TsaClient {
             self.digest_algorithm,
             data_hash,
             self.policy_oid.as_ref(),
-            Some(nonce),
+            Some(&nonce),
             self.cert_req,
         )?;
 
@@ -172,7 +172,7 @@ impl TsaClient {
             "Sending TimeStampReq to {} ({} bytes, nonce={})",
             self.url,
             req_der.len(),
-            nonce,
+            nonce.iter().map(|b| format!("{b:02x}")).collect::<String>(),
         );
 
         // HTTP POST to TSA
@@ -225,7 +225,7 @@ impl TsaClient {
         let token_der = token::validate_timestamp_response(
             &resp,
             data_hash,
-            Some(nonce),
+            Some(&nonce),
             self.digest_algorithm,
             &self.verification_certs,
         )?;

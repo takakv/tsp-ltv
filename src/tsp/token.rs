@@ -134,7 +134,7 @@ pub fn build_timestamp_request(
     digest_algorithm: DigestAlgorithm,
     message_hash: &[u8],
     policy_oid: Option<&ObjectIdentifier>,
-    nonce: Option<u64>,
+    nonce: Option<&[u8]>,
     cert_req: bool,
 ) -> Result<Vec<u8>, TspError> {
     let mut parts: Vec<Vec<u8>> = Vec::new();
@@ -166,7 +166,7 @@ pub fn build_timestamp_request(
 
     // nonce OPTIONAL
     if let Some(n) = nonce {
-        parts.push(der_utils::encode_integer_u64(n));
+        parts.push(der_utils::encode_integer_bytes(n));
     }
 
     // certReq BOOLEAN DEFAULT FALSE — only encode when TRUE
@@ -349,7 +349,7 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
 pub fn validate_timestamp_response(
     resp: &TimeStampResp,
     expected_hash: &[u8],
-    expected_nonce: Option<u64>,
+    expected_nonce: Option<&[u8]>,
     digest_algorithm: DigestAlgorithm,
     extra_certs: &[Certificate],
 ) -> Result<Vec<u8>, TspError> {
@@ -406,7 +406,7 @@ pub fn verify_timestamp_token(
     token_der: &[u8],
     expected_hash: &[u8],
     digest_algorithm: DigestAlgorithm,
-    expected_nonce: Option<u64>,
+    expected_nonce: Option<&[u8]>,
     trust_store: Option<&TrustStore>,
     validation_time: Option<der::DateTime>,
     extra_certs: &[Certificate],
@@ -637,7 +637,7 @@ fn verify_token_cms(
 fn check_tst_info_matches(
     tst_info: &TstInfo,
     expected_hash: &[u8],
-    expected_nonce: Option<u64>,
+    expected_nonce: Option<&[u8]>,
     digest_algorithm: DigestAlgorithm,
 ) -> Result<(), TspError> {
     use subtle::ConstantTimeEq;
@@ -661,12 +661,19 @@ fn check_tst_info_matches(
     }
 
     if let Some(expected) = expected_nonce {
-        match tst_info.nonce {
-            // Constant-time nonce comparison (L-7).
-            Some(actual) if bool::from(actual.ct_eq(&expected)) => {}
+        let expected: &[u8] = match expected.iter().position(|&b| b != 0) {
+            Some(i) => &expected[i..],
+            None => &[0x00],
+        };
+        match &tst_info.nonce {
+            Some(actual)
+                if actual.len() == expected.len()
+                    && bool::from(actual.as_slice().ct_eq(expected)) => {}
             Some(actual) => {
                 return Err(TspError::InvalidResponse(format!(
-                    "nonce mismatch: expected {expected}, got {actual}"
+                    "nonce mismatch: expected 0x{}, got 0x{}",
+                    nonce_hex(expected),
+                    nonce_hex(actual)
                 )));
             }
             None => {
@@ -1029,8 +1036,9 @@ pub struct TstInfo {
     pub serial_number: Vec<u8>,
     /// The generation time (raw DER bytes of GeneralizedTime).
     pub gen_time_der: Vec<u8>,
-    /// Nonce from the response (if present).
-    pub nonce: Option<u64>,
+    /// Nonce from the response (if present; raw big-endian INTEGER
+    /// with the positive sign pad stripped).
+    pub nonce: Option<Vec<u8>>,
     /// The TSA policy OID.
     pub policy_oid: Option<String>,
 }
@@ -1188,10 +1196,7 @@ fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
                 }
                 // nonce INTEGER
                 0x02 => {
-                    nonce =
-                        Some(der_utils::decode_integer_u64(fbody).map_err(|e| {
-                            TspError::InvalidResponse(format!("TSTInfo nonce: {e}"))
-                        })?);
+                    nonce = Some(der_utils::parse_integer_body(fbody));
                 }
                 // tsa [0] GeneralName
                 0xA0 => {
@@ -1273,10 +1278,15 @@ fn digest_algorithm_identifier(alg: DigestAlgorithm) -> AlgorithmIdentifierOwned
 // ---------------------------------------------------------------------------
 
 /// Generate a cryptographically random 64-bit nonce for timestamp requests.
-pub fn generate_nonce() -> u64 {
-    let mut buf = [0u8; 8];
+pub fn generate_nonce() -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
     getrandom::getrandom(&mut buf).expect("OS random number generator");
-    u64::from_ne_bytes(buf)
+    buf
+}
+
+/// Lowercase hex rendering of nonce bytes for diagnostics.
+fn nonce_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,8 +1314,8 @@ mod tests {
     #[test]
     fn test_build_timestamp_request_with_nonce() {
         let hash = vec![0xBB; 32];
-        let nonce = 12345678u64;
-        let req = build_timestamp_request(DigestAlgorithm::Sha256, &hash, None, Some(nonce), true)
+        let nonce = [0xC5u8; 20];
+        let req = build_timestamp_request(DigestAlgorithm::Sha256, &hash, None, Some(&nonce), true)
             .unwrap();
 
         let (tag, _body) = der_utils::parse_tlv(&req).unwrap();
@@ -1826,16 +1836,17 @@ mod tests {
             &token,
             &hash,
             DigestAlgorithm::Sha256,
-            Some(nonce),
+            Some(&nonce.to_be_bytes()),
             None,
             None,
             &[],
         )
         .expect("validly-signed token must verify");
         assert_eq!(tst.message_hash, hash);
-        assert_eq!(tst.nonce, Some(nonce));
+        assert_eq!(tst.nonce, Some(der_utils::integer_body_u64(nonce)));
     }
 
+    #[test]
     #[test]
     fn test_verify_valid_token_with_trust_store() {
         let hash = vec![0x11u8; 32];
@@ -1858,7 +1869,7 @@ mod tests {
             &token,
             &hash,
             DigestAlgorithm::Sha256,
-            Some(nonce),
+            Some(&nonce.to_be_bytes()),
             Some(&store),
             Some(validation_time()),
             &[],
