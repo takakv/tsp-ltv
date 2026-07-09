@@ -7,9 +7,9 @@
 //! - RSA PKCS#1 v1.5 with MD5 (legacy), SHA-1 (legacy), SHA-224 (legacy), SHA-256, SHA-384, SHA-512
 //! - RSA-PSS (RSASSA-PSS) with SHA-256, SHA-384, SHA-512
 //! - ECDSA P-256/P-384 with SHA-1 (legacy)
-//! - ECDSA P-256 with SHA-256
-//! - ECDSA P-384 with SHA-384
-//! - ECDSA P-521 with SHA-512
+//! - ECDSA P-256 with SHA-256, SHA-384, SHA-512
+//! - ECDSA P-384 with SHA-256, SHA-384, SHA-512
+//! - ECDSA P-521 with SHA-256, SHA-384, SHA-512
 //! - Ed25519
 //! - DSA (DSS) with SHA-1 (legacy) and SHA-256
 //!
@@ -145,8 +145,20 @@ fn verify_ecdsa_bound(
         (EcCurve::P256, EcdsaHash::Sha256) => {
             (kryptering::EcCurve::P256, kryptering::HashAlgorithm::Sha256)
         }
+        (EcCurve::P256, EcdsaHash::Sha384) => {
+            (kryptering::EcCurve::P256, kryptering::HashAlgorithm::Sha384)
+        }
+        (EcCurve::P256, EcdsaHash::Sha512) => {
+            (kryptering::EcCurve::P256, kryptering::HashAlgorithm::Sha512)
+        }
+        (EcCurve::P384, EcdsaHash::Sha256) => {
+            (kryptering::EcCurve::P384, kryptering::HashAlgorithm::Sha256)
+        }
         (EcCurve::P384, EcdsaHash::Sha384) => {
             (kryptering::EcCurve::P384, kryptering::HashAlgorithm::Sha384)
+        }
+        (EcCurve::P384, EcdsaHash::Sha512) => {
+            (kryptering::EcCurve::P384, kryptering::HashAlgorithm::Sha512)
         }
         (EcCurve::P521, EcdsaHash::Sha512) => {
             (kryptering::EcCurve::P521, kryptering::HashAlgorithm::Sha512)
