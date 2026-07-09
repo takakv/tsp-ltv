@@ -120,6 +120,21 @@ pub fn encode_der_length(out: &mut Vec<u8>, len: usize) {
     }
 }
 
+/// Encode unsigned big-endian value bytes as a DER INTEGER.
+pub fn encode_integer_bytes(bytes: &[u8]) -> Vec<u8> {
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    let significant = &bytes[start..];
+
+    let needs_padding = significant.is_empty() || (significant[0] & 0x80) != 0;
+    let mut value_bytes = Vec::with_capacity(significant.len() + 1);
+    if needs_padding {
+        value_bytes.push(0x00);
+    }
+    value_bytes.extend_from_slice(significant);
+
+    encode_tlv(0x02, &value_bytes)
+}
+
 /// Encode a non-negative integer as DER INTEGER.
 pub fn encode_integer_u64(val: u64) -> Vec<u8> {
     let be_bytes = val.to_be_bytes();
@@ -176,6 +191,13 @@ pub fn decode_integer_u64(bytes: &[u8]) -> Result<u64, String> {
 /// Encode a DER BOOLEAN value.
 pub fn encode_boolean(val: bool) -> Vec<u8> {
     encode_tlv(0x01, &[if val { 0xFF } else { 0x00 }])
+}
+
+/// Convert a `u64` into its minimal big-endian byte representation.
+pub fn integer_body_u64(val: u64) -> Vec<u8> {
+    let bytes = val.to_be_bytes();
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(7);
+    bytes[start..].to_vec()
 }
 
 /// Extract the raw body bytes of an INTEGER from a DER-encoded integer.
