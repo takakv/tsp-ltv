@@ -31,10 +31,12 @@
 //! # }
 //! ```
 
+#[cfg(feature = "net")]
 pub mod client;
 pub mod token;
 
 // Re-exports
+#[cfg(feature = "net")]
 pub use client::{TsaClient, TsaClientPool};
 pub use token::{
     build_timestamp_request, extract_tst_info, generate_nonce, parse_timestamp_response,

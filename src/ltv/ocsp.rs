@@ -49,6 +49,7 @@
 use std::time::Duration;
 
 use der::Encode;
+#[cfg(feature = "net")]
 use reqwest::Client;
 use x509_cert::Certificate;
 
@@ -145,11 +146,13 @@ pub enum ResponderId {
 
 /// OCSP client for querying certificate revocation status.
 #[derive(Debug, Clone)]
+#[cfg(feature = "net")]
 pub struct OcspClient {
     http_client: Client,
     timeout: Duration,
 }
 
+#[cfg(feature = "net")]
 impl OcspClient {
     /// Create a new OCSP client with default settings.
     pub fn new() -> Self {
@@ -309,6 +312,7 @@ impl OcspClient {
     }
 }
 
+#[cfg(feature = "net")]
 impl Default for OcspClient {
     fn default() -> Self {
         Self::new()

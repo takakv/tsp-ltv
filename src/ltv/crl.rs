@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "net")]
 use reqwest::Client;
 use x509_cert::Certificate;
 
@@ -40,6 +41,7 @@ struct CrlCacheEntry {
 /// will not follow redirects to literal non-public addresses. Fetched CRL
 /// bodies are capped at [`MAX_BODY_SIZE`] to prevent memory exhaustion.
 #[derive(Debug, Clone)]
+#[cfg(feature = "net")]
 pub struct CrlClient {
     http_client: Client,
     timeout: Duration,
@@ -70,10 +72,12 @@ const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 /// pre-egress URL validation) live in [`crate::net`] so the CRL fetch path and
 /// the AIA chain-builder ([`crate::ltv::chain`]) share one implementation
 /// rather than duplicating the logic (ADR-0010).
+#[cfg(feature = "net")]
 fn default_http_client() -> Client {
     crate::net::hardened_http_client()
 }
 
+#[cfg(feature = "net")]
 impl CrlClient {
     /// Create a new CRL client with default settings.
     ///
@@ -352,6 +356,7 @@ impl CrlClient {
     }
 }
 
+#[cfg(feature = "net")]
 impl Default for CrlClient {
     fn default() -> Self {
         Self::new()
