@@ -21,7 +21,7 @@ pub mod error;
 pub mod trust;
 
 // Feature-gated modules
-#[cfg(feature = "tsp")]
+#[cfg(feature = "net")]
 pub mod net;
 
 #[cfg(feature = "tsp")]
